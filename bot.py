@@ -464,6 +464,8 @@ def build_app() -> Application:
         Application.builder()
         .token(BOT_TOKEN)
         .concurrent_updates(True)
+        .post_init(on_startup_ptb)
+        .post_shutdown(on_shutdown_ptb)
         .build()
     )
 
@@ -477,26 +479,12 @@ def build_app() -> Application:
 
     application.add_handler(CallbackQueryHandler(on_choice, pattern=r'^c:'))
 
-    application.post_init(on_startup_ptb)
-    application.post_shutdown(on_shutdown_ptb)
-
     return application
 
 
 async def main_async() -> None:
     app = build_app()
-    # استخدام تشغيل يدوي بدلاً من run_polling كي لا نحجب نفس حلقة الحدث
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    log.info('[bot] polling started')
-    # الانتظار حتى التوقف
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+    await app.run_polling()
 
 
 if __name__ == '__main__':
