@@ -1,9 +1,11 @@
 services:
   - type: web
     name: telegram-file-bot
-    env: docker
+    env: python
     plan: free
     autoDeploy: true
+    buildCommand: bash render-build.sh
+    startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
         sync: false
