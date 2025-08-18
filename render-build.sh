@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 set -euxo pipefail
 
-if [ -f apt.txt ]; then
-  apt-get update
-  xargs -a apt.txt apt-get install -y --no-install-recommends
-  apt-get clean
-fi
-
+# مهم: لا نستخدم apt-get هنا. Render يثبّت محتويات apt.txt تلقائيًا.
 python -m pip install --upgrade pip
 pip install -r requirements.txt
