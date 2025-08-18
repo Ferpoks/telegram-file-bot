@@ -1,10 +1,7 @@
-# أدوات التحويل
 libreoffice
 ffmpeg
 poppler-utils
-# خطوط لدعم العربية في LibreOffice/PDF
+ghostscript
 fonts-noto
 fonts-noto-cjk
 fonts-dejavu
-# تحسينات PDF/صور (تستخدمها بعض الأدوات داخليًا)
-ghostscript
