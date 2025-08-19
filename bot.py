@@ -32,7 +32,8 @@ from telegram.ext import (
 # ===== الإعدادات العامة =====
 ENV_PATH = Path('.env')
 if ENV_PATH.exists():
-    load_dotenv(ENV_PATH, override=True)
+    # مهم: لا نسمح للـ .env أن يطغى على متغيرات Render
+    load_dotenv(ENV_PATH, override=False)
 
 BOT_TOKEN = os.getenv('BOT_TOKEN') or ''
 if not BOT_TOKEN:
@@ -51,6 +52,7 @@ log = logging.getLogger('convbot')
 PENDING: dict[str, dict] = {}
 
 # ===== أدوات مساعدة =====
+# فحوص ومسارات للأدوات النظامية (LibreOffice/FFmpeg/Poppler)
 DOC_EXTS = {"doc", "docx", "odt", "rtf"}
 PPT_EXTS = {"ppt", "pptx", "odp"}
 XLS_EXTS = {"xls", "xlsx", "ods"}
@@ -64,10 +66,8 @@ SAFE_CHARS = re.compile(r"[^A-Za-z0-9_.\- ]+")
 
 
 def safe_name(name: str, fallback: str = "file") -> str:
-    name = name.strip() or fallback
-    # إزالة الرموز غير الآمنة
+    name = (name or "").strip() or fallback
     name = SAFE_CHARS.sub("_", name)
-    # الحد من الطول
     return name[:200]
 
 
@@ -87,6 +87,22 @@ async def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
     )
     out, err = await proc.communicate()
     return proc.returncode, out.decode(errors='ignore'), err.decode(errors='ignore')
+
+
+def find_bin(*names: str) -> str:
+    """أرجع أول مسار متاح لأحد الأوامر، وإلا ارفع خطأ مفهوم."""
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    raise FileNotFoundError(f"لم يتم العثور على أي من: {', '.join(names)}")
+
+
+def ensure_bin(name: str, friendly: str) -> str:
+    p = shutil.which(name)
+    if not p:
+        raise RuntimeError(f"الأداة {friendly} غير مثبّتة في النظام ({name}).")
+    return p
 
 
 # ===== منطق الكشف عن النوع وبناء الخيارات =====
@@ -119,7 +135,6 @@ def options_for(kind: str, ext: str) -> list[list[InlineKeyboardButton]]:
         ])
     elif kind == 'image':
         row1 = [InlineKeyboardButton('إلى PDF', callback_data='c:PDF')]
-        # تحويلات صورة↔صورة
         targets = ['JPG', 'PNG', 'WEBP']
         row2 = [InlineKeyboardButton(f'إلى {t}', callback_data=f'c:{t}') for t in targets if t.lower() != ext]
         btns.append(row1)
@@ -138,9 +153,10 @@ def options_for(kind: str, ext: str) -> list[list[InlineKeyboardButton]]:
 # ===== وظائف التحويل =====
 
 async def office_to_pdf(in_path: Path, out_dir: Path) -> Path:
-    # LibreOffice headless
+    # ابحث عن LibreOffice: قد تكون soffice أو libreoffice أو lowriter
+    lo = find_bin('soffice', 'libreoffice', 'lowriter')
     cmd = [
-        'soffice', '--headless', '--nologo', '--nofirststartwizard',
+        lo, '--headless', '--nologo', '--nofirststartwizard',
         '--convert-to', 'pdf', '--outdir', str(out_dir), str(in_path)
     ]
     code, out, err = await run_cmd(cmd)
@@ -148,7 +164,6 @@ async def office_to_pdf(in_path: Path, out_dir: Path) -> Path:
         raise RuntimeError(f"LibreOffice فشل: {err or out}")
     out_path = out_dir / (in_path.stem + '.pdf')
     if not out_path.exists():
-        # أحيانًا يُنتج اسماً مختلفاً مع الامتداد الكبير
         candidates = list(out_dir.glob(in_path.stem + '*.pdf'))
         if candidates:
             out_path = candidates[0]
@@ -201,7 +216,8 @@ async def image_to_image(in_path: Path, out_dir: Path, target_ext: str) -> Path:
 
 
 async def pdf_to_images_zip(in_path: Path, out_dir: Path, fmt: str = 'png') -> Path:
-    # يستخدم poppler: pdftoppm
+    # تأكد من وجود Poppler (pdftoppm)
+    ensure_bin('pdftoppm', 'Poppler')
     from pdf2image import convert_from_path
     pages = await asyncio.to_thread(convert_from_path, str(in_path), dpi=150)
     tmp_imgs: list[Path] = []
@@ -223,6 +239,7 @@ async def pdf_to_images_zip(in_path: Path, out_dir: Path, fmt: str = 'png') -> P
 async def audio_convert_ffmpeg(in_path: Path, out_dir: Path, target_ext: str) -> Path:
     target_ext = target_ext.lower()
     out_path = out_dir / (in_path.stem + f'.{target_ext}')
+    ff = ensure_bin('ffmpeg', 'FFmpeg')
     if target_ext == 'mp3':
         args = ['-vn', '-c:a', 'libmp3lame', '-q:a', '2']
     elif target_ext == 'wav':
@@ -231,7 +248,7 @@ async def audio_convert_ffmpeg(in_path: Path, out_dir: Path, target_ext: str) ->
         args = ['-vn', '-c:a', 'libvorbis', '-q:a', '5']
     else:
         raise RuntimeError('صيغة صوت غير مدعومة')
-    cmd = ['ffmpeg', '-y', '-i', str(in_path), *args, str(out_path)]
+    cmd = [ff, '-y', '-i', str(in_path), *args, str(out_path)]
     code, out, err = await run_cmd(cmd)
     if code != 0:
         raise RuntimeError(f"FFmpeg فشل: {err or out}")
@@ -240,8 +257,9 @@ async def audio_convert_ffmpeg(in_path: Path, out_dir: Path, target_ext: str) ->
 
 async def video_to_mp4_ffmpeg(in_path: Path, out_dir: Path) -> Path:
     out_path = out_dir / (in_path.stem + '.mp4')
+    ff = ensure_bin('ffmpeg', 'FFmpeg')
     cmd = [
-        'ffmpeg', '-y', '-i', str(in_path),
+        ff, '-y', '-i', str(in_path),
         '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
         '-c:a', 'aac', '-b:a', '128k', str(out_path)
     ]
@@ -280,7 +298,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not msg:
         return
 
-    # تحديد الملف ومعرفة الامتداد
     file_id: str
     file_name: str | None = None
 
@@ -307,7 +324,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await msg.reply_text('صيغة غير معروفة. أرسل ملفًا بصيغة شائعة أو مع اسم/امتداد واضح.')
         return
 
-    # حفظ حالة الاختيار
     token = uuid.uuid4().hex[:10]
     PENDING[token] = {
         'file_id': file_id,
@@ -346,8 +362,6 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             pass
         return
 
-    # ابحث عن آخر رسالة تحتوي على حالة محفوظة في نفس الدردشة (بشكل مبسّط نأخذ أحدث token)
-    # للحفاظ على البساطة، نمرّ على PENDING ونأخذ أول عنصر (الأحدث عادةً)
     if not PENDING:
         await query.edit_message_text('انتهت صلاحية الطلب. أرسل الملف مرة أخرى.')
         return
@@ -361,15 +375,14 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await query.edit_message_text('⏳ جارٍ التحويل...')
     try:
-        await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-    except Exception:
-        pass
+        try:
+            await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+        except Exception:
+            pass
 
-    # تنزيل الملف والتحويل
-    workdir = Path(tempfile.mkdtemp(prefix='convbot_'))
-    in_path = workdir / safe_name(file_name or 'file')
+        workdir = Path(tempfile.mkdtemp(prefix='convbot_'))
+        in_path = workdir / safe_name(file_name or 'file')
 
-    try:
         tgfile = await context.bot.get_file(file_id)
         await tgfile.download_to_drive(str(in_path))
 
@@ -405,12 +418,10 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not size_ok(out_path):
             raise RuntimeError('حجم الملف الناتج أكبر من الحد المسموح به للإرسال.')
 
-        # إرسال الناتج
-        caption = '✔️ تم التحويل'
         await query.message.reply_document(
             document=InputFile(str(out_path)),
             filename=out_path.name,
-            caption=caption
+            caption='✔️ تم التحويل'
         )
         await query.edit_message_text('تم الإرسال ✅')
     except Exception as e:
@@ -420,12 +431,10 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
     finally:
-        # تنظيف
         try:
             shutil.rmtree(workdir, ignore_errors=True)
         except Exception:
             pass
-        # إزالة الحالة
         PENDING.pop(token, None)
 
 
@@ -436,7 +445,6 @@ async def make_web_app() -> web.Application:
     async def health(_request):
         return web.json_response({"ok": True, "service": "converter-bot"})
 
-    # لا نُسجل HEAD منفصلاً حتى لا يحدث تعارض
     app.router.add_get('/health', health)
     app.router.add_get('/', health)
     return app
@@ -453,6 +461,12 @@ async def on_startup_ptb(app: Application) -> None:
     # ضمان عدم وجود Webhook عند استخدام polling
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+    # طباعة معلومات البوت للتحقق من التوكن المستخدم
+    try:
+        me = await app.bot.get_me()
+        log.info(f"[bot] started as @{me.username} (id={me.id})")
     except Exception:
         pass
     log.info(f"[http] serving on 0.0.0.0:{PORT}")
@@ -484,7 +498,7 @@ def build_app() -> Application:
 
     application.add_handler(CallbackQueryHandler(on_choice, pattern=r'^c:'))
 
-        # Error handler عام
+    # Error handler عام
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception('Unhandled error: %s', context.error)
 
@@ -495,7 +509,7 @@ def build_app() -> Application:
 
 def main() -> None:
     app = build_app()
-    # ملاحظة: run_polling تُدير حلقة الحدث داخليًا؛ لا نستخدم asyncio.run هنا.
+    # مهم: run_polling تدير حلقة الحدث ومزودة بإسقاط التحديثات المتراكمة
     app.run_polling(drop_pending_updates=True)
 
 
