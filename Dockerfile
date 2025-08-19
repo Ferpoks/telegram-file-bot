@@ -17,4 +17,6 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY . /app
 EXPOSE 10000
-CMD ["python", "bot.py"]
+
+# الافتراضي يشغّل الويب؛ سنغيّر Start Command في خدمة الوركر على Render
+CMD ["python", "bot_web.py"]
