@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-import asyncio, logging, os, re, shutil, tempfile, uuid
+import asyncio, logging, os, re, shutil, tempfile, uuid, time
+from collections import defaultdict, deque
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
 
@@ -11,7 +12,7 @@ from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFi
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
-# ===== إعدادات عامة =====
+# ===================== إعدادات عامة =====================
 ENV_PATH = Path('.env')
 if ENV_PATH.exists():
     # لا نسمح للـ .env أن يطغى على متغيرات Render
@@ -23,16 +24,36 @@ if not BOT_TOKEN:
 
 PORT = int(os.getenv('PORT', '10000'))
 
-# حد الإرسال للبوت: استخدم TG_LIMIT_MB أو MAX_SEND_MB أو 49 بشكل افتراضي
+# حد رفع تيليجرام للبوت (MB). غيّره من env أو بأمر /setlimit
 TG_LIMIT_MB = int(os.getenv('TG_LIMIT_MB', os.getenv('MAX_SEND_MB', '49')))
 TG_LIMIT_BYTES = TG_LIMIT_MB * 1024 * 1024
 
+# مدير/أدمن
+OWNER_ID = int(os.getenv('OWNER_ID', '0') or 0)
+ADMINS = {OWNER_ID} if OWNER_ID else set()
+
+# التوازي وحدّ العمليات
+MAX_CONCURRENCY = int(os.getenv('MAX_CONCURRENCY', '2'))
+OPS_PER_MINUTE = int(os.getenv('OPS_PER_MINUTE', '10'))
+
+# سجلات عامة
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 log = logging.getLogger('convbot')
 
-PENDING: dict[str, dict] = {}
+# ===================== حالات وتشخيص =====================
+PENDING: dict[str, dict] = {}                  # آخر ملف بانتظار الاختيار
+BIN = {"soffice": None, "pdftoppm": None, "ffmpeg": None, "gs": None}  # مسارات الأدوات
+sem = asyncio.Semaphore(MAX_CONCURRENCY)       # حد التوازي
+USER_QPS: dict[int, deque] = defaultdict(deque)  # حد العمليات/دقيقة لكل مستخدم
+BANNED: set[int] = set()
 
-# ===== امتدادات =====
+STATS = {
+    "ok": 0, "fail": 0,
+    "bytes_in": 0, "bytes_out": 0,
+    "started_at": int(time.time())
+}
+
+# ===================== الامتدادات والدوال المساعدة =====================
 DOC_EXTS = {"doc", "docx", "odt", "rtf"}
 PPT_EXTS = {"ppt", "pptx", "odp"}
 XLS_EXTS = {"xls", "xlsx", "ods"}
@@ -41,9 +62,6 @@ AUD_EXTS = {"mp3", "wav", "ogg", "m4a"}
 VID_EXTS = {"mp4", "mov", "mkv", "avi", "webm"}
 ALL_OFFICE = DOC_EXTS | PPT_EXTS | XLS_EXTS
 SAFE_CHARS = re.compile(r"[^A-Za-z0-9_.\- ]+")
-
-# حالة الأدوات (تتعبّى عند التشغيل)
-BIN = {"soffice": None, "pdftoppm": None, "ffmpeg": None, "gs": None}
 
 def safe_name(name: str, fallback: str = "file") -> str:
     name = (name or "").strip() or fallback
@@ -54,6 +72,14 @@ def ext_of(filename: str | None) -> str:
 
 def size_ok(path: Path) -> bool:
     return path.stat().st_size <= TG_LIMIT_BYTES
+
+def fmt_bytes(n:int)->str:
+    x = float(n)
+    for u in ['B','KB','MB','GB','TB']:
+        if x < 1024:
+            return f"{x:.1f}{u}"
+        x /= 1024
+    return f"{x:.1f}PB"
 
 async def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -66,7 +92,24 @@ def which(*names: str) -> str | None:
         if p: return p
     return None
 
-# ===== كشف النوع =====
+# ===================== صلاحيات/حدود =====================
+def is_admin(uid: int) -> bool:
+    return uid in ADMINS
+
+def is_banned(uid: int) -> bool:
+    return uid in BANNED
+
+def allow(uid: int) -> bool:
+    dq = USER_QPS[uid]
+    now = time.time()
+    while dq and now - dq[0] > 60:
+        dq.popleft()
+    if len(dq) >= OPS_PER_MINUTE:
+        return False
+    dq.append(now)
+    return True
+
+# ===================== كشف النوع وبناء الأزرار =====================
 def kind_for_extension(ext: str) -> str:
     if ext in IMG_EXTS: return 'image'
     if ext in AUD_EXTS: return 'audio'
@@ -78,7 +121,8 @@ def kind_for_extension(ext: str) -> str:
 def options_for(kind: str, ext: str) -> list[list[InlineKeyboardButton]]:
     btns: list[list[InlineKeyboardButton]] = []
     if kind == 'office':
-        if BIN["soffice"]:  # لا نظهر الخيار لو LibreOffice غير متوفر
+        # لا نظهر التحويل إن لم تتوفر LibreOffice
+        if BIN["soffice"]:
             btns.append([InlineKeyboardButton('تحويل إلى PDF', callback_data='c:PDF')])
     elif kind == 'pdf':
         btns.append([InlineKeyboardButton('PDF → DOCX', callback_data='c:DOCX')])
@@ -97,10 +141,11 @@ def options_for(kind: str, ext: str) -> list[list[InlineKeyboardButton]]:
             row = [InlineKeyboardButton(f'إلى {t}', callback_data=f'c:{t}') for t in ['MP3','WAV','OGG'] if t.lower()!=ext]
             if row: btns.append(row)
     elif kind == 'video':
-        if BIN["ffmpeg"]: btns.append([InlineKeyboardButton('إلى MP4', callback_data='c:MP4')])
+        if BIN["ffmpeg"]:
+            btns.append([InlineKeyboardButton('إلى MP4', callback_data='c:MP4')])
     return btns
 
-# ===== تحويلات أساسية =====
+# ===================== وظائف التحويل الأساسية =====================
 async def office_to_pdf(in_path: Path, out_dir: Path) -> Path:
     if not BIN["soffice"]:
         raise RuntimeError('لا يمكن Office→PDF لأن LibreOffice غير مثبت.')
@@ -152,7 +197,7 @@ async def image_to_image(in_path: Path, out_dir: Path, target_ext: str, max_side
             im.save(out_path)
     await asyncio.to_thread(_do); return out_path
 
-# PDF → صور (ZIP)، مع تقسيم إذا تعدّى الحد
+# PDF → صور (ZIP) مع تقسيم إلى أجزاء ≤ الحد
 async def pdf_to_images_zip_parts(in_path: Path, out_dir: Path, fmt: str='png') -> list[Path]:
     if not BIN["pdftoppm"]:
         raise RuntimeError('لا يمكن PDF→صور لأن Poppler (pdftoppm) غير مثبت.')
@@ -186,11 +231,10 @@ async def pdf_to_images_zip_parts(in_path: Path, out_dir: Path, fmt: str='png') 
         parts.append(z)
     return parts
 
-# ===== تخفيض الحجم عند الحاجة =====
+# ===================== تخفيض الحجم =====================
 async def shrink_pdf(in_path: Path, out_dir: Path) -> Path | None:
     if not BIN["gs"]:
         return None
-    # جرّب /ebook ثم /screen
     for preset in ('/ebook','/screen'):
         out = out_dir / (in_path.stem + f'.min.pdf')
         cmd = [BIN["gs"], '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4',
@@ -218,7 +262,6 @@ async def shrink_video(in_path: Path, out_dir: Path) -> Path | None:
     return src if src!=in_path and size_ok(src) else None
 
 async def shrink_image(in_path: Path, out_dir: Path, ext: str) -> Path | None:
-    # خفّض الأبعاد إلى 2000 ثم 1400 مع جودة 85 ثم 75
     for max_side, q in [(2000,85),(1400,75)]:
         out = await image_to_image(in_path, out_dir, target_ext=ext, max_side=max_side, quality=q)
         if size_ok(out): return out
@@ -227,37 +270,65 @@ async def shrink_image(in_path: Path, out_dir: Path, ext: str) -> Path | None:
 async def shrink_audio(in_path: Path, out_dir: Path, ext: str) -> Path | None:
     if not BIN["ffmpeg"]:
         return None
-    out = out_dir / (in_path.stem + f'.{ext}')
-    if ext=='mp3':
-        args = ['-vn','-c:a','libmp3lame','-q:a','5']
-    elif ext=='ogg':
-        args = ['-vn','-c:a','libvorbis','-q:a','3']
-    elif ext=='wav':
-        # WAV غير مضغوط غالبًا؛ الأفضل تحويله إلى MP3
-        out = out_dir / (in_path.stem + '.mp3')
-        args = ['-vn','-c:a','libmp3lame','-q:a','5']
-    else:
-        return None
+    out = out_dir / (in_path.stem + ('.mp3' if ext=='wav' else f'.{ext}'))
+    if ext=='mp3': args = ['-vn','-c:a','libmp3lame','-q:a','5']
+    elif ext=='ogg': args = ['-vn','-c:a','libvorbis','-q:a','3']
+    elif ext=='wav': args = ['-vn','-c:a','libmp3lame','-q:a','5']
+    else: return None
     code, _, _ = await run_cmd([BIN["ffmpeg"],'-y','-i',str(in_path), *args, str(out)])
     return out if code==0 and out.exists() else None
 
-# ===== Handlers =====
-HELP_TEXT = ("أرسل أي ملف (كـ *مستند* وليس صورة مضغوطة)\n"
-"المدعوم:\n"
-"• DOC/DOCX/RTF/ODT/PPT/PPTX/XLS/XLSX → PDF\n"
-"• PDF → DOCX / PNG(ZIP) / JPG(ZIP)\n"
-"• صور JPG/PNG/WEBP ↔ JPG/PNG/WEBP / صورة → PDF\n"
-"• صوت MP3/WAV/OGG / فيديو → MP4\n")
+# ===================== نصوص واجهة =====================
+FORMATS_TEXT = (
+    "✅ المدعوم حاليًا:\n"
+    "• Office → PDF (DOC/DOCX/RTF/ODT/PPT/PPTX/XLS/XLSX)\n"
+    "• PDF → DOCX | صور (PNG/JPG داخل ZIP)\n"
+    "• صور JPG/PNG/WEBP ↔ بين بعض | صورة → PDF\n"
+    "• صوت: MP3/WAV/OGG — فيديو: إلى MP4\n"
+)
 
+HELP_TEXT = ("أرسل أي ملف (كـ *مستند* وليس صورة مضغوطة)\n" + FORMATS_TEXT)
+
+# ===================== Handlers (مستخدم) =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("👋 أهلاً! أنا بوت تحويل الملفات.\n\n"+HELP_TEXT, disable_web_page_preview=True)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📚 المساعدة", callback_data="menu:help"),
+         InlineKeyboardButton("🧾 الصيغ", callback_data="menu:formats")]
+    ])
+    await update.message.reply_text(
+        "👋 أهلاً! أنا بوت تحويل الملفات.\n"
+        "أرسل أي ملف كـ *مستند* وسأعرض لك التحويلات المتاحة.\n",
+        reply_markup=kb, disable_web_page_preview=True
+    )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(HELP_TEXT, disable_web_page_preview=True)
+    await update.message.reply_text("ℹ️ مساعدة:\n" + HELP_TEXT, disable_web_page_preview=True)
+
+async def formats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("🧾 الصيغ:\n" + FORMATS_TEXT, disable_web_page_preview=True)
+
+async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q: return
+    await q.answer()
+    data = q.data or ""
+    if data == "menu:help":
+        await q.edit_message_text("ℹ️ مساعدة:\n" + HELP_TEXT)
+    elif data == "menu:formats":
+        await q.edit_message_text("🧾 الصيغ:\n" + FORMATS_TEXT)
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     if not msg: return
+    uid = msg.from_user.id if msg.from_user else 0
+
+    if is_banned(uid):
+        await msg.reply_text("🚫 تم حظرك من استخدام البوت.")
+        return
+    if not allow(uid):
+        await msg.reply_text("⏳ محاولات كثيرة جدًا. جرّب بعد دقيقة.")
+        return
+
     if msg.document:
         file_id = msg.document.file_id; file_name = msg.document.file_name or 'file'
     elif msg.photo:
@@ -267,7 +338,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif msg.video:
         file_id = msg.video.file_id; file_name = msg.video.file_name or 'video'
     else:
-        await msg.reply_text('أرسل الملف كـ *مستند* من فضلك.'); return
+        await msg.reply_text('📎 أرسل الملف كـ *مستند* من فضلك.'); return
 
     ext = ext_of(file_name); kind = kind_for_extension(ext)
     if kind == 'unknown':
@@ -299,81 +370,80 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not PENDING:
         await query.edit_message_text('انتهت صلاحية الطلب.'); return
+
     token, meta = next(reversed(list(PENDING.items())))
     file_id, file_name, ext, kind = meta['file_id'], meta['file_name'], meta['ext'], meta['kind']
 
     await query.edit_message_text('⏳ جارٍ التحويل...')
     workdir = Path(tempfile.mkdtemp(prefix='convbot_'))
     try:
-        try: await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-        except: pass
+        async with sem:
+            try: await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+            except: pass
 
-        in_path = workdir / safe_name(file_name or 'file')
-        tgfile = await context.bot.get_file(file_id)
-        await tgfile.download_to_drive(str(in_path))
+            in_path = workdir / safe_name(file_name or 'file')
+            tgfile = await context.bot.get_file(file_id)
+            await tgfile.download_to_drive(str(in_path))
+            try: STATS["bytes_in"] += in_path.stat().st_size
+            except: pass
 
-        out_paths: list[Path] = []  # قد نرسل عدة ملفات
-        # 1) التحويل الأساسي
-        if kind == 'office' and choice == 'PDF':
-            out = await office_to_pdf(in_path, workdir); out_paths = [out]
+            out_paths: list[Path] = []  # قد نرسل عدة ملفات
 
-        elif kind == 'pdf' and choice == 'DOCX':
-            out = await pdf_to_docx(in_path, workdir); out_paths = [out]
+            # 1) التحويل
+            if kind == 'office' and choice == 'PDF':
+                out = await office_to_pdf(in_path, workdir); out_paths = [out]
+            elif kind == 'pdf' and choice == 'DOCX':
+                out = await pdf_to_docx(in_path, workdir); out_paths = [out]
+            elif kind == 'pdf' and choice == 'PNGZIP':
+                out_paths = await pdf_to_images_zip_parts(in_path, workdir, fmt='png')
+            elif kind == 'pdf' and choice == 'JPGZIP':
+                out_paths = await pdf_to_images_zip_parts(in_path, workdir, fmt='jpg')
+            elif kind == 'image' and choice == 'PDF':
+                out = await image_to_pdf(in_path, workdir); out_paths = [out]
+            elif kind == 'image' and choice in {'JPG','PNG','WEBP'}:
+                out = await image_to_image(in_path, workdir, target_ext=choice.lower()); out_paths = [out]
+            elif kind == 'audio' and choice in {'MP3','WAV','OGG'}:
+                out = await audio_convert_ffmpeg(in_path, workdir, target_ext=choice.lower()); out_paths = [out]
+            elif kind == 'video' and choice == 'MP4':
+                out = await video_to_mp4_ffmpeg(in_path, workdir); out_paths = [out]
+            else:
+                raise RuntimeError('هذا التحويل غير مدعوم.')
 
-        elif kind == 'pdf' and choice == 'PNGZIP':
-            out_paths = await pdf_to_images_zip_parts(in_path, workdir, fmt='png')
+            # 2) تقليل الحجم إن لزم
+            fixed: list[Path] = []
+            for p in out_paths:
+                if size_ok(p):
+                    fixed.append(p); continue
+                if p.suffix.lower()=='.pdf':
+                    shr = await shrink_pdf(p, workdir)
+                    if shr and size_ok(shr): fixed.append(shr)
+                elif p.suffix.lower()=='.mp4':
+                    shr = await shrink_video(p, workdir)
+                    if shr and size_ok(shr): fixed.append(shr)
+                elif p.suffix.lower() in {'.jpg','.jpeg','.png','.webp'}:
+                    shr = await shrink_image(p, workdir, p.suffix.lstrip('.'))
+                    if shr and size_ok(shr): fixed.append(shr)
+                elif p.suffix.lower() in {'.mp3','.wav','.ogg'}:
+                    shr = await shrink_audio(p, workdir, p.suffix.lstrip('.'))
+                    if shr and size_ok(shr): fixed.append(shr)
 
-        elif kind == 'pdf' and choice == 'JPGZIP':
-            out_paths = await pdf_to_images_zip_parts(in_path, workdir, fmt='jpg')
+            to_send = [p for p in (fixed or out_paths) if size_ok(p)]
+            if not to_send:
+                raise RuntimeError(f'الملف الناتج أكبر من حد تيليجرام ({TG_LIMIT_MB}MB). جرّب ملف أصغر أو تحويلًا آخر.')
 
-        elif kind == 'image' and choice == 'PDF':
-            out = await image_to_pdf(in_path, workdir); out_paths = [out]
+            # 3) الإرسال
+            for idx, p in enumerate(to_send, 1):
+                cap = '✔️ تم التحويل' + (f' (جزء {idx}/{len(to_send)})' if len(to_send)>1 else '')
+                with open(p, 'rb') as fh:
+                    await query.message.reply_document(document=InputFile(fh, filename=p.name), caption=cap)
+                try: STATS["bytes_out"] += p.stat().st_size
+                except: pass
 
-        elif kind == 'image' and choice in {'JPG','PNG','WEBP'}:
-            out = await image_to_image(in_path, workdir, target_ext=choice.lower()); out_paths = [out]
-
-        elif kind == 'audio' and choice in {'MP3','WAV','OGG'}:
-            out = await audio_convert_ffmpeg(in_path, workdir, target_ext=choice.lower()); out_paths = [out]
-
-        elif kind == 'video' and choice == 'MP4':
-            out = await video_to_mp4_ffmpeg(in_path, workdir); out_paths = [out]
-
-        else:
-            raise RuntimeError('هذا التحويل غير مدعوم.')
-
-        # 2) إذا أي ناتج تعدّى الحد: حاول تقليله
-        fixed: list[Path] = []
-        for p in out_paths:
-            if size_ok(p):
-                fixed.append(p); continue
-            # مسارات التخفيض حسب النوع
-            if p.suffix.lower()=='.pdf':
-                shr = await shrink_pdf(p, workdir)
-                if shr and size_ok(shr): fixed.append(shr)
-            elif p.suffix.lower()=='.mp4':
-                shr = await shrink_video(p, workdir)
-                if shr and size_ok(shr): fixed.append(shr)
-            elif p.suffix.lower() in {'.jpg','.jpeg','.png','.webp'}:
-                shr = await shrink_image(p, workdir, p.suffix.lstrip('.'))
-                if shr and size_ok(shr): fixed.append(shr)
-            elif p.suffix.lower() in {'.mp3','.wav','.ogg'}:
-                shr = await shrink_audio(p, workdir, p.suffix.lstrip('.'))
-                if shr and size_ok(shr): fixed.append(shr)
-            # ZIP لا يمكن ضغطه أكثر هنا (تقسيم الصفحات تم سابقًا)
-        # لو ما زال كبير، اتركه بدون إرسال
-
-        to_send = [p for p in (fixed or out_paths) if size_ok(p)]
-        if not to_send:
-            raise RuntimeError(f'الملف الناتج أكبر من حد تيليجرام ({TG_LIMIT_MB}MB). جرّب ملف أصغر أو اختر تحويلًا آخر.')
-
-        # 3) الإرسال (قد تكون عدة ملفات)
-        for idx, p in enumerate(to_send, 1):
-            cap = '✔️ تم التحويل' + (f' (جزء {idx}/{len(to_send)})' if len(to_send)>1 else '')
-            with open(p, 'rb') as fh:
-                await query.message.reply_document(document=InputFile(fh, filename=p.name), caption=cap)
-        await query.edit_message_text('تم الإرسال ✅')
+            STATS["ok"] += 1
+            await query.edit_message_text('تم الإرسال ✅')
 
     except Exception as e:
+        STATS["fail"] += 1
         log.exception('conversion error')
         try: await query.edit_message_text(f'❌ فشل التحويل: {e}')
         except: pass
@@ -382,7 +452,63 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except: pass
         PENDING.pop(token, None)
 
-# ===== خادم صحة + تشخيص =====
+# ===================== Handlers (مدير) =====================
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid):
+        return await update.message.reply_text("🚫 هذا الأمر للمدير فقط.")
+    up = int(time.time()) - STATS["started_at"]
+    await update.message.reply_text(
+        "🛠️ لوحة المدير\n"
+        f"- أدوات: soffice={bool(BIN['soffice'])}, pdftoppm={bool(BIN['pdftoppm'])}, ffmpeg={bool(BIN['ffmpeg'])}, gs={bool(BIN['gs'])}\n"
+        f"- الحد الحالي: {TG_LIMIT_MB}MB | التوازي: {MAX_CONCURRENCY} | OPS/min: {OPS_PER_MINUTE}\n"
+        f"- تشغيل منذ: {up//3600}h {(up%3600)//60}m\n"
+        f"- محظورون: {len(BANNED)}"
+    )
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ok, fail = STATS["ok"], STATS["fail"]
+    await update.message.reply_text(
+        "📈 الإحصاءات\n"
+        f"- نجاح: {ok} | فشل: {fail}\n"
+        f"- دخل: {fmt_bytes(STATS['bytes_in'])} | خرج: {fmt_bytes(STATS['bytes_out'])}"
+    )
+
+async def setlimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid):
+        return await update.message.reply_text("🚫 هذا الأمر للمدير فقط.")
+    if not context.args:
+        return await update.message.reply_text("استخدم: /setlimit 49")
+    try:
+        mb = int(context.args[0])
+        if mb < 1: raise ValueError()
+        global TG_LIMIT_MB, TG_LIMIT_BYTES
+        TG_LIMIT_MB = mb
+        TG_LIMIT_BYTES = mb * 1024 * 1024
+        await update.message.reply_text(f"✅ تم ضبط الحد إلى {mb}MB")
+    except:
+        await update.message.reply_text("قيمة غير صالحة.")
+
+async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid): return await update.message.reply_text("🚫 للمَدير فقط.")
+    if not context.args: return await update.message.reply_text("استخدم: /ban <user_id>")
+    try:
+        BANNED.add(int(context.args[0]))
+        await update.message.reply_text("تم الحظر ✅")
+    except: await update.message.reply_text("user_id غير صالح.")
+
+async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid): return await update.message.reply_text("🚫 للمَدير فقط.")
+    if not context.args: return await update.message.reply_text("استخدم: /unban <user_id>")
+    try:
+        BANNED.discard(int(context.args[0]))
+        await update.message.reply_text("تم إلغاء الحظر ✅")
+    except: await update.message.reply_text("user_id غير صالح.")
+
+# ===================== خادم صحة + تشخيص =====================
 async def make_web_app() -> web.Application:
     app = web.Application()
     async def health(_): return web.json_response({"ok": True, "service": "converter-bot"})
@@ -426,10 +552,21 @@ def build_app() -> Application:
         .post_init(on_startup_ptb)
         .post_shutdown(on_shutdown_ptb)
         .build())
+    # أوامر المستخدم
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help_cmd))
+    application.add_handler(CommandHandler('formats', formats_cmd))
+    # أوامر المدير
+    application.add_handler(CommandHandler('admin', admin_cmd))
+    application.add_handler(CommandHandler('stats', stats_cmd))
+    application.add_handler(CommandHandler('setlimit', setlimit_cmd))
+    application.add_handler(CommandHandler('ban', ban_cmd))
+    application.add_handler(CommandHandler('unban', unban_cmd))
+    # ملفات وقوائم
     application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VIDEO, handle_file))
     application.add_handler(CallbackQueryHandler(on_choice, pattern=r'^c:'))
+    application.add_handler(CallbackQueryHandler(on_menu, pattern=r'^menu:'))
+
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception('Unhandled error: %s', context.error)
     application.add_error_handler(on_error)
@@ -441,4 +578,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-
