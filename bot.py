@@ -74,7 +74,8 @@ IMG_EXTS = {"jpg", "jpeg", "png", "webp", "bmp", "tiff"}
 AUD_EXTS = {"mp3", "wav", "ogg", "m4a"}
 VID_EXTS = {"mp4", "mov", "mkv", "avi", "webm"}
 ALL_OFFICE = DOC_EXTS | PPT_EXTS | XLS_EXTS
-SAFE_CHARS = re.compile(r"[^A-Za-z0-9_.\\- ]+")
+# ✅ إصلاح الـ regex: باك سلاش واحد فقط قبل الشرطة أو ضع الشرطة آخر المجموعة
+SAFE_CHARS = re.compile(r"[^A-Za-z0-9_.\- ]+")
 
 def safe_name(name: str, fallback: str = "file") -> str:
     name = (name or "").strip() or fallback
@@ -449,7 +450,6 @@ async def on_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_user_lang(uid, code)
     # بعد اختيار اللغة: اطلب الاشتراك أو ابدأ مباشرة
     if SUB_CHANNEL:
-        # أرسل رسالة الاشتراك إن لم يكن عضو
         ok = await ensure_joined(context.bot, uid)
         if not ok:
             join_url = f"https://t.me/{SUB_CHANNEL.lstrip('@')}" if SUB_CHANNEL.startswith("@") else None
@@ -616,9 +616,6 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         PENDING.pop(token, None)
 
 # ===================== Handlers (مدير) =====================
-def is_admin(uid: int) -> bool:
-    return uid in ADMINS
-
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else 0
     if not is_admin(uid):
