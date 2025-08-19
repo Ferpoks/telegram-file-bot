@@ -17,7 +17,7 @@ from telegram import (
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    FSInputFile,   # <-- مهم
+    InputFile,  # ← نستخدم InputFile المتوافق
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -52,7 +52,6 @@ log = logging.getLogger('convbot')
 PENDING: dict[str, dict] = {}
 
 # ===== أدوات مساعدة =====
-# فحوص ومسارات للأدوات النظامية (LibreOffice/FFmpeg/Poppler)
 DOC_EXTS = {"doc", "docx", "odt", "rtf"}
 PPT_EXTS = {"ppt", "pptx", "odp"}
 XLS_EXTS = {"xls", "xlsx", "ods"}
@@ -90,7 +89,6 @@ async def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
 
 
 def find_bin(*names: str) -> str:
-    """أرجع أول مسار متاح لأحد الأوامر، وإلا ارفع خطأ مفهوم."""
     for n in names:
         p = shutil.which(n)
         if p:
@@ -106,7 +104,6 @@ def ensure_bin(name: str, friendly: str) -> str:
 
 
 # ===== منطق الكشف عن النوع وبناء الخيارات =====
-
 def kind_for_extension(ext: str) -> str:
     if ext in IMG_EXTS:
         return 'image'
@@ -126,9 +123,7 @@ def options_for(kind: str, ext: str) -> list[list[InlineKeyboardButton]]:
     if kind == 'office':
         btns.append([InlineKeyboardButton('تحويل إلى PDF', callback_data='c:PDF')])
     elif kind == 'pdf':
-        btns.append([
-            InlineKeyboardButton('PDF → DOCX', callback_data='c:DOCX'),
-        ])
+        btns.append([InlineKeyboardButton('PDF → DOCX', callback_data='c:DOCX')])
         btns.append([
             InlineKeyboardButton('PDF → صور PNG (ZIP)', callback_data='c:PNGZIP'),
             InlineKeyboardButton('PDF → صور JPG (ZIP)', callback_data='c:JPGZIP'),
@@ -136,13 +131,15 @@ def options_for(kind: str, ext: str) -> list[list[InlineKeyboardButton]]:
     elif kind == 'image':
         row1 = [InlineKeyboardButton('إلى PDF', callback_data='c:PDF')]
         targets = ['JPG', 'PNG', 'WEBP']
-        row2 = [InlineKeyboardButton(f'إلى {t}', callback_data=f'c:{t}') for t in targets if t.lower() != ext]
+        row2 = [InlineKeyboardButton(f'إلى {t}', callback_data=f'c:{t}')
+                for t in targets if t.lower() != ext]
         btns.append(row1)
         if row2:
             btns.append(row2)
     elif kind == 'audio':
         targets = ['MP3', 'WAV', 'OGG']
-        row = [InlineKeyboardButton(f'إلى {t}', callback_data=f'c:{t}') for t in targets if t.lower() != ext]
+        row = [InlineKeyboardButton(f'إلى {t}', callback_data=f'c:{t}')
+               for t in targets if t.lower() != ext]
         if row:
             btns.append(row)
     elif kind == 'video':
@@ -151,14 +148,10 @@ def options_for(kind: str, ext: str) -> list[list[InlineKeyboardButton]]:
 
 
 # ===== وظائف التحويل =====
-
 async def office_to_pdf(in_path: Path, out_dir: Path) -> Path:
-    # ابحث عن LibreOffice: قد تكون soffice أو libreoffice أو lowriter
     lo = find_bin('soffice', 'libreoffice', 'lowriter')
-    cmd = [
-        lo, '--headless', '--nologo', '--nofirststartwizard',
-        '--convert-to', 'pdf', '--outdir', str(out_dir), str(in_path)
-    ]
+    cmd = [lo, '--headless', '--nologo', '--nofirststartwizard',
+           '--convert-to', 'pdf', '--outdir', str(out_dir), str(in_path)]
     code, out, err = await run_cmd(cmd)
     if code != 0:
         raise RuntimeError(f"LibreOffice فشل: {err or out}")
@@ -216,7 +209,6 @@ async def image_to_image(in_path: Path, out_dir: Path, target_ext: str) -> Path:
 
 
 async def pdf_to_images_zip(in_path: Path, out_dir: Path, fmt: str = 'png') -> Path:
-    # تأكد من وجود Poppler (pdftoppm)
     ensure_bin('pdftoppm', 'Poppler')
     from pdf2image import convert_from_path
     pages = await asyncio.to_thread(convert_from_path, str(in_path), dpi=150)
@@ -258,11 +250,9 @@ async def audio_convert_ffmpeg(in_path: Path, out_dir: Path, target_ext: str) ->
 async def video_to_mp4_ffmpeg(in_path: Path, out_dir: Path) -> Path:
     out_path = out_dir / (in_path.stem + '.mp4')
     ff = ensure_bin('ffmpeg', 'FFmpeg')
-    cmd = [
-        ff, '-y', '-i', str(in_path),
-        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
-        '-c:a', 'aac', '-b:a', '128k', str(out_path)
-    ]
+    cmd = [ff, '-y', '-i', str(in_path),
+           '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+           '-c:a', 'aac', '-b:a', '128k', str(out_path)]
     code, out, err = await run_cmd(cmd)
     if code != 0:
         raise RuntimeError(f"FFmpeg فشل: {err or out}")
@@ -270,7 +260,6 @@ async def video_to_mp4_ffmpeg(in_path: Path, out_dir: Path) -> Path:
 
 
 # ===== Handlers =====
-
 HELP_TEXT = (
     "أرسل أي ملف (كـ *مستند* وليس صورة مضغوطة)،\n"
     "سأعرض عليك التحويلات المتاحة له.\n\n"
@@ -314,7 +303,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         file_id = msg.video.file_id
         file_name = msg.video.file_name or 'video'
     else:
-        await msg.reply_text('أرسل الملف كـ *مستند* من فضلك.', parse_mode=None)
+        await msg.reply_text('أرسل الملف كـ *مستند* من فضلك.')
         return
 
     ext = ext_of(file_name)
@@ -325,12 +314,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     token = uuid.uuid4().hex[:10]
-    PENDING[token] = {
-        'file_id': file_id,
-        'file_name': file_name,
-        'ext': ext,
-        'kind': kind,
-    }
+    PENDING[token] = {'file_id': file_id, 'file_name': file_name, 'ext': ext, 'kind': kind}
 
     kb = options_for(kind, ext)
     if not kb:
@@ -418,10 +402,14 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not size_ok(out_path):
             raise RuntimeError('حجم الملف الناتج أكبر من الحد المسموح به للإرسال.')
 
-        # مهم: استخدم FSInputFile لضمان إرسال الملف وليس نص المسار
-        fs = FSInputFile(str(out_path), filename=out_path.name)
-        await query.message.reply_document(document=fs, caption='✔️ تم التحويل')
+        # ⚠️ مهم: افتح الملف وأرسله عبر InputFile، لا تمرر مسار كسلسلة
+        with open(out_path, 'rb') as fh:
+            await query.message.reply_document(
+                document=InputFile(fh, filename=out_path.name),
+                caption='✔️ تم التحويل'
+            )
         await query.edit_message_text('تم الإرسال ✅')
+
     except Exception as e:
         log.exception('conversion error')
         try:
@@ -439,41 +427,29 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ===== خادم مصغر للصحة (Render) =====
 async def make_web_app() -> web.Application:
     app = web.Application()
-
-    async def health(_request):
-        return web.json_response({"ok": True, "service": "converter-bot"})
-
+    async def health(_request): return web.json_response({"ok": True, "service": "converter-bot"})
     app.router.add_get('/health', health)
     app.router.add_get('/', health)
     return app
 
 
 async def on_startup_ptb(app: Application) -> None:
-    # تشغيل خادم aiohttp جنبًا إلى جنب
     webapp = await make_web_app()
-    runner = web.AppRunner(webapp)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
+    runner = web.AppRunner(webapp); await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT); await site.start()
     app.bot_data['web_runner'] = runner
-    # حذف أي Webhook قبل polling
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
-    # طباعة معلومات البوت للتحقق من التوكن المستخدم
+    try: await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception: pass
     try:
         me = await app.bot.get_me()
         log.info(f"[bot] started as @{me.username} (id={me.id})")
-    except Exception:
-        pass
+    except Exception: pass
     log.info(f"[http] serving on 0.0.0.0:{PORT}")
 
 
 async def on_shutdown_ptb(app: Application) -> None:
     runner: web.AppRunner | None = app.bot_data.get('web_runner')
-    if runner:
-        await runner.cleanup()
+    if runner: await runner.cleanup()
 
 
 def build_app() -> Application:
@@ -485,21 +461,15 @@ def build_app() -> Application:
         .post_shutdown(on_shutdown_ptb)
         .build()
     )
-
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help_cmd))
-
     application.add_handler(MessageHandler(
-        filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VIDEO,
-        handle_file
+        filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VIDEO, handle_file
     ))
-
     application.add_handler(CallbackQueryHandler(on_choice, pattern=r'^c:'))
 
-    # Error handler عام
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        log.exception('Unhandled error: %s', context.error)
-
+        logging.exception('Unhandled error: %s', context.error)
     application.add_error_handler(on_error)
     return application
 
