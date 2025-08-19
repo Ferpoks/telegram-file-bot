@@ -450,6 +450,11 @@ async def on_startup_ptb(app: Application) -> None:
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     app.bot_data['web_runner'] = runner
+    # ضمان عدم وجود Webhook عند استخدام polling
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
     log.info(f"[http] serving on 0.0.0.0:{PORT}")
 
 
@@ -479,13 +484,19 @@ def build_app() -> Application:
 
     application.add_handler(CallbackQueryHandler(on_choice, pattern=r'^c:'))
 
+        # Error handler عام
+    async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        log.exception('Unhandled error: %s', context.error)
+
+    application.add_error_handler(on_error)
+
     return application
 
 
 def main() -> None:
     app = build_app()
     # ملاحظة: run_polling تُدير حلقة الحدث داخليًا؛ لا نستخدم asyncio.run هنا.
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == '__main__':
