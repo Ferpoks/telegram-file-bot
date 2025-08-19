@@ -1,7 +1,0 @@
-libreoffice
-ffmpeg
-poppler-utils
-ghostscript
-fonts-noto
-fonts-noto-cjk
-fonts-dejavu
