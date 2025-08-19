@@ -8,7 +8,7 @@ services:
       - key: BOT_TOKEN
         sync: false
       - key: USE_WEBHOOK
-        value: "0"                # مؤقتاً لأول نشر
+        value: "0"              # أول نشر فقط
       - key: PUBLIC_URL
         value: https://placeholder.invalid
       - key: PORT
@@ -18,19 +18,13 @@ services:
           type: redis
           name: conv-redis-oa59
           property: connectionString
-      - key: TG_LIMIT_MB
-        value: "49"
-      - key: OPS_PER_MINUTE
-        value: "10"
-      - key: OWNER_ID
-        sync: false
 
   - type: worker
     name: conv-worker-oa59
     env: docker
     plan: free
     autoDeploy: true
-    startCommand: python worker.py   # مسموح فقط للوركر
+    startCommand: python worker.py   # فقط هنا
     envVars:
       - key: BOT_TOKEN
         sync: false
@@ -39,10 +33,3 @@ services:
           type: redis
           name: conv-redis-oa59
           property: connectionString
-      - key: TG_LIMIT_MB
-        value: "49"
-
-  - type: redis
-    name: conv-redis-oa59
-    ipAllowList: []
-    plan: free
