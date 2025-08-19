@@ -17,7 +17,7 @@ from telegram import (
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    InputFile,
+    FSInputFile,   # <-- مهم
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -32,7 +32,7 @@ from telegram.ext import (
 # ===== الإعدادات العامة =====
 ENV_PATH = Path('.env')
 if ENV_PATH.exists():
-    # مهم: لا نسمح للـ .env أن يطغى على متغيرات Render
+    # لا نسمح للـ .env أن يطغى على متغيرات Render
     load_dotenv(ENV_PATH, override=False)
 
 BOT_TOKEN = os.getenv('BOT_TOKEN') or ''
@@ -40,7 +40,7 @@ if not BOT_TOKEN:
     raise RuntimeError('BOT_TOKEN مفقود في المتغيرات البيئية')
 
 PORT = int(os.getenv('PORT', '10000'))
-MAX_SEND_MB = int(os.getenv('MAX_SEND_MB', '48'))  # حد الإرسال بعد التحويل
+MAX_SEND_MB = int(os.getenv('MAX_SEND_MB', '48'))  # حد الإرسال بعد التحويل (MB)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -418,11 +418,9 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not size_ok(out_path):
             raise RuntimeError('حجم الملف الناتج أكبر من الحد المسموح به للإرسال.')
 
-        await query.message.reply_document(
-            document=InputFile(str(out_path)),
-            filename=out_path.name,
-            caption='✔️ تم التحويل'
-        )
+        # مهم: استخدم FSInputFile لضمان إرسال الملف وليس نص المسار
+        fs = FSInputFile(str(out_path), filename=out_path.name)
+        await query.message.reply_document(document=fs, caption='✔️ تم التحويل')
         await query.edit_message_text('تم الإرسال ✅')
     except Exception as e:
         log.exception('conversion error')
@@ -458,7 +456,7 @@ async def on_startup_ptb(app: Application) -> None:
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     app.bot_data['web_runner'] = runner
-    # ضمان عدم وجود Webhook عند استخدام polling
+    # حذف أي Webhook قبل polling
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
     except Exception:
@@ -503,15 +501,14 @@ def build_app() -> Application:
         log.exception('Unhandled error: %s', context.error)
 
     application.add_error_handler(on_error)
-
     return application
 
 
 def main() -> None:
     app = build_app()
-    # مهم: run_polling تدير حلقة الحدث ومزودة بإسقاط التحديثات المتراكمة
     app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == '__main__':
     main()
+
