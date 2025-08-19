@@ -5,7 +5,7 @@ services:
     plan: free
     autoDeploy: true
     envVars:
-   8467639971:AAF9YWvvsR0KYwPxBKsUkjdoBTtpmnxeqU8: BOT_TOKEN
+   key: BOT_TOKEN
         sync: false
       - key: PORT
         value: "10000"
