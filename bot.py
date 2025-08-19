@@ -64,8 +64,10 @@ SAFE_CHARS = re.compile(r"[^A-Za-z0-9_.\- ]+")
 
 
 def safe_name(name: str, fallback: str = "file") -> str:
-    name = (name or "").strip() or fallback
+    name = name.strip() or fallback
+    # إزالة الرموز غير الآمنة
     name = SAFE_CHARS.sub("_", name)
+    # الحد من الطول
     return name[:200]
 
 
@@ -117,6 +119,7 @@ def options_for(kind: str, ext: str) -> list[list[InlineKeyboardButton]]:
         ])
     elif kind == 'image':
         row1 = [InlineKeyboardButton('إلى PDF', callback_data='c:PDF')]
+        # تحويلات صورة↔صورة
         targets = ['JPG', 'PNG', 'WEBP']
         row2 = [InlineKeyboardButton(f'إلى {t}', callback_data=f'c:{t}') for t in targets if t.lower() != ext]
         btns.append(row1)
@@ -135,6 +138,7 @@ def options_for(kind: str, ext: str) -> list[list[InlineKeyboardButton]]:
 # ===== وظائف التحويل =====
 
 async def office_to_pdf(in_path: Path, out_dir: Path) -> Path:
+    # LibreOffice headless
     cmd = [
         'soffice', '--headless', '--nologo', '--nofirststartwizard',
         '--convert-to', 'pdf', '--outdir', str(out_dir), str(in_path)
@@ -144,6 +148,7 @@ async def office_to_pdf(in_path: Path, out_dir: Path) -> Path:
         raise RuntimeError(f"LibreOffice فشل: {err or out}")
     out_path = out_dir / (in_path.stem + '.pdf')
     if not out_path.exists():
+        # أحيانًا يُنتج اسماً مختلفاً مع الامتداد الكبير
         candidates = list(out_dir.glob(in_path.stem + '*.pdf'))
         if candidates:
             out_path = candidates[0]
@@ -196,6 +201,7 @@ async def image_to_image(in_path: Path, out_dir: Path, target_ext: str) -> Path:
 
 
 async def pdf_to_images_zip(in_path: Path, out_dir: Path, fmt: str = 'png') -> Path:
+    # يستخدم poppler: pdftoppm
     from pdf2image import convert_from_path
     pages = await asyncio.to_thread(convert_from_path, str(in_path), dpi=150)
     tmp_imgs: list[Path] = []
@@ -274,6 +280,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not msg:
         return
 
+    # تحديد الملف ومعرفة الامتداد
     file_id: str
     file_name: str | None = None
 
@@ -300,6 +307,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await msg.reply_text('صيغة غير معروفة. أرسل ملفًا بصيغة شائعة أو مع اسم/امتداد واضح.')
         return
 
+    # حفظ حالة الاختيار
     token = uuid.uuid4().hex[:10]
     PENDING[token] = {
         'file_id': file_id,
@@ -338,6 +346,8 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             pass
         return
 
+    # ابحث عن آخر رسالة تحتوي على حالة محفوظة في نفس الدردشة (بشكل مبسّط نأخذ أحدث token)
+    # للحفاظ على البساطة، نمرّ على PENDING ونأخذ أول عنصر (الأحدث عادةً)
     if not PENDING:
         await query.edit_message_text('انتهت صلاحية الطلب. أرسل الملف مرة أخرى.')
         return
@@ -351,14 +361,15 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await query.edit_message_text('⏳ جارٍ التحويل...')
     try:
-        try:
-            await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-        except Exception:
-            pass
+        await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+    except Exception:
+        pass
 
-        workdir = Path(tempfile.mkdtemp(prefix='convbot_'))
-        in_path = workdir / safe_name(file_name or 'file')
+    # تنزيل الملف والتحويل
+    workdir = Path(tempfile.mkdtemp(prefix='convbot_'))
+    in_path = workdir / safe_name(file_name or 'file')
 
+    try:
         tgfile = await context.bot.get_file(file_id)
         await tgfile.download_to_drive(str(in_path))
 
@@ -394,10 +405,12 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not size_ok(out_path):
             raise RuntimeError('حجم الملف الناتج أكبر من الحد المسموح به للإرسال.')
 
+        # إرسال الناتج
+        caption = '✔️ تم التحويل'
         await query.message.reply_document(
             document=InputFile(str(out_path)),
             filename=out_path.name,
-            caption='✔️ تم التحويل'
+            caption=caption
         )
         await query.edit_message_text('تم الإرسال ✅')
     except Exception as e:
@@ -407,10 +420,12 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
     finally:
+        # تنظيف
         try:
             shutil.rmtree(workdir, ignore_errors=True)
         except Exception:
             pass
+        # إزالة الحالة
         PENDING.pop(token, None)
 
 
@@ -421,12 +436,14 @@ async def make_web_app() -> web.Application:
     async def health(_request):
         return web.json_response({"ok": True, "service": "converter-bot"})
 
+    # لا نُسجل HEAD منفصلاً حتى لا يحدث تعارض
     app.router.add_get('/health', health)
     app.router.add_get('/', health)
     return app
 
 
 async def on_startup_ptb(app: Application) -> None:
+    # تشغيل خادم aiohttp جنبًا إلى جنب
     webapp = await make_web_app()
     runner = web.AppRunner(webapp)
     await runner.setup()
@@ -465,14 +482,11 @@ def build_app() -> Application:
     return application
 
 
-async def main_async() -> None:
+def main() -> None:
     app = build_app()
-    await app.run_polling()
+    # ملاحظة: run_polling تُدير حلقة الحدث داخليًا؛ لا نستخدم asyncio.run هنا.
+    app.run_polling()
 
 
 if __name__ == '__main__':
-    try:
-        asyncio.run(main_async())
-    except KeyboardInterrupt:
-        pass
-
+    main()
