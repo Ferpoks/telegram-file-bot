@@ -15,7 +15,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 # ===================== إعدادات عامة =====================
 ENV_PATH = Path('.env')
 if ENV_PATH.exists():
-    # لا نسمح للـ .env أن يطغى على متغيرات Render
     load_dotenv(ENV_PATH, override=False)
 
 BOT_TOKEN = os.getenv('BOT_TOKEN') or ''
@@ -24,7 +23,7 @@ if not BOT_TOKEN:
 
 PORT = int(os.getenv('PORT', '10000'))
 
-# حد رفع تيليجرام للبوت (MB). غيّره من env أو بأمر /setlimit
+# حد رفع تيليجرام للبوت (MB)
 TG_LIMIT_MB = int(os.getenv('TG_LIMIT_MB', os.getenv('MAX_SEND_MB', '49')))
 TG_LIMIT_BYTES = TG_LIMIT_MB * 1024 * 1024
 
@@ -47,11 +46,7 @@ sem = asyncio.Semaphore(MAX_CONCURRENCY)       # حد التوازي
 USER_QPS: dict[int, deque] = defaultdict(deque)  # حد العمليات/دقيقة لكل مستخدم
 BANNED: set[int] = set()
 
-STATS = {
-    "ok": 0, "fail": 0,
-    "bytes_in": 0, "bytes_out": 0,
-    "started_at": int(time.time())
-}
+STATS = {"ok": 0, "fail": 0, "bytes_in": 0, "bytes_out": 0, "started_at": int(time.time())}
 
 # ===================== الامتدادات والدوال المساعدة =====================
 DOC_EXTS = {"doc", "docx", "odt", "rtf"}
@@ -121,7 +116,6 @@ def kind_for_extension(ext: str) -> str:
 def options_for(kind: str, ext: str) -> list[list[InlineKeyboardButton]]:
     btns: list[list[InlineKeyboardButton]] = []
     if kind == 'office':
-        # لا نظهر التحويل إن لم تتوفر LibreOffice
         if BIN["soffice"]:
             btns.append([InlineKeyboardButton('تحويل إلى PDF', callback_data='c:PDF')])
     elif kind == 'pdf':
@@ -197,7 +191,6 @@ async def image_to_image(in_path: Path, out_dir: Path, target_ext: str, max_side
             im.save(out_path)
     await asyncio.to_thread(_do); return out_path
 
-# PDF → صور (ZIP) مع تقسيم إلى أجزاء ≤ الحد
 async def pdf_to_images_zip_parts(in_path: Path, out_dir: Path, fmt: str='png') -> list[Path]:
     if not BIN["pdftoppm"]:
         raise RuntimeError('لا يمكن PDF→صور لأن Poppler (pdftoppm) غير مثبت.')
@@ -286,7 +279,6 @@ FORMATS_TEXT = (
     "• صور JPG/PNG/WEBP ↔ بين بعض | صورة → PDF\n"
     "• صوت: MP3/WAV/OGG — فيديو: إلى MP4\n"
 )
-
 HELP_TEXT = ("أرسل أي ملف (كـ *مستند* وليس صورة مضغوطة)\n" + FORMATS_TEXT)
 
 # ===================== Handlers (مستخدم) =====================
@@ -323,11 +315,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     uid = msg.from_user.id if msg.from_user else 0
 
     if is_banned(uid):
-        await msg.reply_text("🚫 تم حظرك من استخدام البوت.")
-        return
+        await msg.reply_text("🚫 تم حظرك من استخدام البوت."); return
     if not allow(uid):
-        await msg.reply_text("⏳ محاولات كثيرة جدًا. جرّب بعد دقيقة.")
-        return
+        await msg.reply_text("⏳ محاولات كثيرة جدًا. جرّب بعد دقيقة."); return
 
     if msg.document:
         file_id = msg.document.file_id; file_name = msg.document.file_name or 'file'
@@ -387,9 +377,8 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             try: STATS["bytes_in"] += in_path.stat().st_size
             except: pass
 
-            out_paths: list[Path] = []  # قد نرسل عدة ملفات
+            out_paths: list[Path] = []
 
-            # 1) التحويل
             if kind == 'office' and choice == 'PDF':
                 out = await office_to_pdf(in_path, workdir); out_paths = [out]
             elif kind == 'pdf' and choice == 'DOCX':
@@ -409,7 +398,6 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 raise RuntimeError('هذا التحويل غير مدعوم.')
 
-            # 2) تقليل الحجم إن لزم
             fixed: list[Path] = []
             for p in out_paths:
                 if size_ok(p):
@@ -431,7 +419,6 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if not to_send:
                 raise RuntimeError(f'الملف الناتج أكبر من حد تيليجرام ({TG_LIMIT_MB}MB). جرّب ملف أصغر أو تحويلًا آخر.')
 
-            # 3) الإرسال
             for idx, p in enumerate(to_send, 1):
                 cap = '✔️ تم التحويل' + (f' (جزء {idx}/{len(to_send)})' if len(to_send)>1 else '')
                 with open(p, 'rb') as fh:
@@ -451,6 +438,35 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try: shutil.rmtree(workdir, ignore_errors=True)
         except: pass
         PENDING.pop(token, None)
+
+# ===================== تحويلات إضافية FFmpeg =====================
+async def audio_convert_ffmpeg(in_path: Path, out_dir: Path, target_ext: str) -> Path:
+    if not BIN["ffmpeg"]:
+        raise RuntimeError('FFmpeg غير متوفر.')
+    target_ext = target_ext.lower()
+    out_path = out_dir / (in_path.stem + f'.{target_ext}')
+    if target_ext=='mp3':
+        args = ['-vn','-c:a','libmp3lame','-q:a','2']
+    elif target_ext=='wav':
+        args = ['-vn','-c:a','pcm_s16le']
+    elif target_ext=='ogg':
+        args = ['-vn','-c:a','libvorbis','-q:a','5']
+    else:
+        raise RuntimeError('صيغة صوت غير مدعومة')
+    code, out, err = await run_cmd([BIN["ffmpeg"], '-y','-i',str(in_path), *args, str(out_path)])
+    if code != 0: raise RuntimeError(f"FFmpeg فشل: {err or out}")
+    return out_path
+
+async def video_to_mp4_ffmpeg(in_path: Path, out_dir: Path) -> Path:
+    if not BIN["ffmpeg"]:
+        raise RuntimeError('FFmpeg غير متوفر.')
+    out_path = out_dir / (in_path.stem + '.mp4')
+    cmd = [BIN["ffmpeg"], '-y','-i',str(in_path),
+           '-c:v','libx264','-preset','veryfast','-crf','23',
+           '-c:a','aac','-b:a','128k', str(out_path)]
+    code, out, err = await run_cmd(cmd)
+    if code != 0: raise RuntimeError(f"FFmpeg فشل: {err or out}")
+    return out_path
 
 # ===================== Handlers (مدير) =====================
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -519,20 +535,17 @@ async def make_web_app() -> web.Application:
     return app
 
 async def on_startup_ptb(app: Application) -> None:
-    # اكتشاف الأدوات
     BIN["soffice"]  = which('soffice','libreoffice','lowriter')
     BIN["pdftoppm"] = which('pdftoppm')
     BIN["ffmpeg"]   = which('ffmpeg')
     BIN["gs"]       = which('gs','ghostscript')
     log.info(f"[bin] soffice={BIN['soffice']}, pdftoppm={BIN['pdftoppm']}, ffmpeg={BIN['ffmpeg']}, gs={BIN['gs']} (limit={TG_LIMIT_MB}MB)")
 
-    # خادم HTTP
     webapp = await make_web_app()
     runner = web.AppRunner(webapp); await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT); await site.start()
     app.bot_data['web_runner'] = runner
 
-    # نظافة polling
     try: await app.bot.delete_webhook(drop_pending_updates=True)
     except: pass
     try:
