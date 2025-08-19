@@ -1,11 +1,46 @@
 services:
   - type: web
-    name: telegram-file-bot
+    name: tg-converter-web
     env: docker
     plan: free
     autoDeploy: true
     envVars:
-   key: BOT_TOKEN
+      - key: BOT_TOKEN
         sync: false
+      - key: PUBLIC_URL
+        value: https://tg-converter-web.onrender.com   # عدّل الاسم بعد إنشاء الخدمة
       - key: PORT
         value: "10000"
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: tg-converter-redis
+          property: connectionString
+      - key: TG_LIMIT_MB
+        value: "49"
+      - key: OPS_PER_MINUTE
+        value: "10"
+      - key: OWNER_ID
+        sync: false
+
+  - type: worker
+    name: tg-converter-worker
+    env: docker
+    plan: free
+    autoDeploy: true
+    startCommand: python worker.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: tg-converter-redis
+          property: connectionString
+      - key: TG_LIMIT_MB
+        value: "49"
+
+  - type: redis
+    name: tg-converter-redis
+    ipAllowList: []
+    plan: free
