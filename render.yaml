@@ -1,20 +1,22 @@
 services:
   - type: web
-    name: tg-converter-web
+    name: conv-web-oa59
     env: docker
     plan: free
     autoDeploy: true
     envVars:
       - key: BOT_TOKEN
         sync: false
+      - key: USE_WEBHOOK
+        value: "0"                # مؤقتاً لأول نشر
       - key: PUBLIC_URL
-        value: https://tg-converter-web.onrender.com   # عدّل الاسم بعد إنشاء الخدمة
+        value: https://placeholder.invalid
       - key: PORT
         value: "10000"
       - key: REDIS_URL
         fromService:
           type: redis
-          name: tg-converter-redis
+          name: conv-redis-oa59
           property: connectionString
       - key: TG_LIMIT_MB
         value: "49"
@@ -24,23 +26,23 @@ services:
         sync: false
 
   - type: worker
-    name: tg-converter-worker
+    name: conv-worker-oa59
     env: docker
     plan: free
     autoDeploy: true
-    startCommand: python worker.py
+    startCommand: python worker.py   # مسموح فقط للوركر
     envVars:
       - key: BOT_TOKEN
         sync: false
       - key: REDIS_URL
         fromService:
           type: redis
-          name: tg-converter-redis
+          name: conv-redis-oa59
           property: connectionString
       - key: TG_LIMIT_MB
         value: "49"
 
   - type: redis
-    name: tg-converter-redis
+    name: conv-redis-oa59
     ipAllowList: []
     plan: free
