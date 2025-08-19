@@ -4,7 +4,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PORT=10000
 
-# أدوات النظام + خطوط
+# أدوات النظام + خطوط (ليشتغل التحويل داخل الحاوية)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       libreoffice ffmpeg poppler-utils ghostscript \
@@ -18,5 +18,4 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 COPY . /app
 EXPOSE 10000
 
-# الافتراضي يشغّل الويب؛ سنغيّر Start Command في خدمة الوركر على Render
-CMD ["python", "bot_web.py"]
+CMD ["python", "bot.py"]
