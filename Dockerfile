@@ -4,7 +4,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PORT=10000
 
-# أدوات التحويل + خطوط عربية
+# أدوات النظام المطلوبة
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       libreoffice ffmpeg poppler-utils ghostscript \
