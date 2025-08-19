@@ -4,7 +4,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PORT=10000
 
-# أدوات النظام المطلوبة
+# أدوات النظام اللازمة + خطوط
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       libreoffice ffmpeg poppler-utils ghostscript \
