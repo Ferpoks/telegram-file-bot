@@ -22,7 +22,10 @@ if not BOT_TOKEN:
     raise RuntimeError('BOT_TOKEN مفقود في المتغيرات البيئية')
 
 PORT = int(os.getenv('PORT', '10000'))
-MAX_SEND_MB = int(os.getenv('MAX_SEND_MB', '48'))
+
+# حد الإرسال للبوت: استخدم TG_LIMIT_MB أو MAX_SEND_MB أو 49 بشكل افتراضي
+TG_LIMIT_MB = int(os.getenv('TG_LIMIT_MB', os.getenv('MAX_SEND_MB', '49')))
+TG_LIMIT_BYTES = TG_LIMIT_MB * 1024 * 1024
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 log = logging.getLogger('convbot')
@@ -40,18 +43,17 @@ ALL_OFFICE = DOC_EXTS | PPT_EXTS | XLS_EXTS
 SAFE_CHARS = re.compile(r"[^A-Za-z0-9_.\- ]+")
 
 # حالة الأدوات (تتعبّى عند التشغيل)
-BIN = {"soffice": None, "pdftoppm": None, "ffmpeg": None}
+BIN = {"soffice": None, "pdftoppm": None, "ffmpeg": None, "gs": None}
 
 def safe_name(name: str, fallback: str = "file") -> str:
     name = (name or "").strip() or fallback
-    name = SAFE_CHARS.sub("_", name)
-    return name[:200]
+    return SAFE_CHARS.sub("_", name)[:200]
 
 def ext_of(filename: str | None) -> str:
     return Path(filename).suffix.lower().lstrip('.') if filename else ""
 
 def size_ok(path: Path) -> bool:
-    return path.stat().st_size <= MAX_SEND_MB * 1024 * 1024
+    return path.stat().st_size <= TG_LIMIT_BYTES
 
 async def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -61,8 +63,7 @@ async def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
 def which(*names: str) -> str | None:
     for n in names:
         p = shutil.which(n)
-        if p:
-            return p
+        if p: return p
     return None
 
 # ===== كشف النوع =====
@@ -77,8 +78,7 @@ def kind_for_extension(ext: str) -> str:
 def options_for(kind: str, ext: str) -> list[list[InlineKeyboardButton]]:
     btns: list[list[InlineKeyboardButton]] = []
     if kind == 'office':
-        # لا نظهر الخيار لو LibreOffice غير متوفر
-        if BIN["soffice"]:
+        if BIN["soffice"]:  # لا نظهر الخيار لو LibreOffice غير متوفر
             btns.append([InlineKeyboardButton('تحويل إلى PDF', callback_data='c:PDF')])
     elif kind == 'pdf':
         btns.append([InlineKeyboardButton('PDF → DOCX', callback_data='c:DOCX')])
@@ -88,8 +88,8 @@ def options_for(kind: str, ext: str) -> list[list[InlineKeyboardButton]]:
         ])
     elif kind == 'image':
         row1 = [InlineKeyboardButton('إلى PDF', callback_data='c:PDF')]
-        targets = ['JPG', 'PNG', 'WEBP']
-        row2 = [InlineKeyboardButton(f'إلى {t}', callback_data=f'c:{t}') for t in targets if t.lower() != ext]
+        targets = ['JPG','PNG','WEBP']
+        row2 = [InlineKeyboardButton(f'إلى {t}', callback_data=f'c:{t}') for t in targets if t.lower()!=ext]
         btns.append(row1); 
         if row2: btns.append(row2)
     elif kind == 'audio':
@@ -97,16 +97,14 @@ def options_for(kind: str, ext: str) -> list[list[InlineKeyboardButton]]:
             row = [InlineKeyboardButton(f'إلى {t}', callback_data=f'c:{t}') for t in ['MP3','WAV','OGG'] if t.lower()!=ext]
             if row: btns.append(row)
     elif kind == 'video':
-        if BIN["ffmpeg"]:
-            btns.append([InlineKeyboardButton('إلى MP4', callback_data='c:MP4')])
+        if BIN["ffmpeg"]: btns.append([InlineKeyboardButton('إلى MP4', callback_data='c:MP4')])
     return btns
 
-# ===== وظائف التحويل =====
+# ===== تحويلات أساسية =====
 async def office_to_pdf(in_path: Path, out_dir: Path) -> Path:
     if not BIN["soffice"]:
-        raise RuntimeError('لا يمكن تحويل Office→PDF لأن LibreOffice غير مثبت على الخادم.')
-    cmd = [BIN["soffice"], '--headless', '--nologo', '--nofirststartwizard', '--convert-to', 'pdf',
-           '--outdir', str(out_dir), str(in_path)]
+        raise RuntimeError('لا يمكن Office→PDF لأن LibreOffice غير مثبت.')
+    cmd = [BIN["soffice"], '--headless','--nologo','--nofirststartwizard','--convert-to','pdf','--outdir', str(out_dir), str(in_path)]
     code, out, err = await run_cmd(cmd)
     if code != 0: raise RuntimeError(f"LibreOffice فشل: {err or out}")
     out_path = out_dir / (in_path.stem + '.pdf')
@@ -124,67 +122,124 @@ async def pdf_to_docx(in_path: Path, out_dir: Path) -> Path:
         finally: cv.close()
     await asyncio.to_thread(_convert); return out_path
 
-async def image_to_pdf(in_path: Path, out_dir: Path) -> Path:
+async def image_to_pdf(in_path: Path, out_dir: Path, dpi: int = 150) -> Path:
     out_path = out_dir / (in_path.stem + '.pdf')
     def _do():
         im = Image.open(in_path)
         if im.mode in ("RGBA","P"): im = im.convert("RGB")
-        im.save(out_path, "PDF", resolution=150.0)
+        im.save(out_path, "PDF", resolution=float(dpi))
     await asyncio.to_thread(_do); return out_path
 
-async def image_to_image(in_path: Path, out_dir: Path, target_ext: str) -> Path:
+async def image_to_image(in_path: Path, out_dir: Path, target_ext: str, max_side: int | None = None, quality: int = 90) -> Path:
     out_path = out_dir / (in_path.stem + f'.{target_ext}')
     def _do():
-        im = Image.open(in_path); fmt = target_ext.upper()
+        im = Image.open(in_path)
+        if max_side:
+            w, h = im.size
+            scale = max(w, h) / max_side
+            if scale > 1:
+                im = im.resize((int(w/scale), int(h/scale)))
+        fmt = target_ext.upper()
         if fmt in ("JPG","JPEG"):
             if im.mode in ("RGBA","P"): im = im.convert("RGB")
-            im.save(out_path, "JPEG", quality=90, optimize=True)
-        elif fmt=="PNG": im.save(out_path, "PNG", optimize=True)
+            im.save(out_path, "JPEG", quality=quality, optimize=True)
+        elif fmt=="PNG":
+            im.save(out_path, "PNG", optimize=True)
         elif fmt=="WEBP":
             if im.mode in ("RGBA","P"): im = im.convert("RGB")
-            im.save(out_path, "WEBP", quality=90, method=4)
-        else: im.save(out_path)
+            im.save(out_path, "WEBP", quality=quality, method=4)
+        else:
+            im.save(out_path)
     await asyncio.to_thread(_do); return out_path
 
-async def pdf_to_images_zip(in_path: Path, out_dir: Path, fmt: str='png') -> Path:
+# PDF → صور (ZIP)، مع تقسيم إذا تعدّى الحد
+async def pdf_to_images_zip_parts(in_path: Path, out_dir: Path, fmt: str='png') -> list[Path]:
     if not BIN["pdftoppm"]:
         raise RuntimeError('لا يمكن PDF→صور لأن Poppler (pdftoppm) غير مثبت.')
     from pdf2image import convert_from_path
     pages = await asyncio.to_thread(convert_from_path, str(in_path), dpi=150)
-    outs = []
+    imgs = []
     for i, im in enumerate(pages, 1):
         out_img = out_dir / f"{in_path.stem}_{i:03d}.{fmt}"
         if fmt.lower()=='jpg':
             im = im.convert('RGB'); im.save(out_img, 'JPEG', quality=90, optimize=True)
         else:
             im.save(out_img, fmt.upper())
-        outs.append(out_img)
-    zip_path = out_dir / f"{in_path.stem}_images_{fmt}.zip"
-    with ZipFile(zip_path, 'w', ZIP_DEFLATED) as zf:
-        for p in outs: zf.write(p, arcname=p.name)
-    return zip_path
+        imgs.append(out_img)
+    parts: list[Path] = []
+    part_idx = 1
+    current: list[Path] = []
+    current_size = 0
+    for p in imgs:
+        s = p.stat().st_size
+        if current and current_size + s > TG_LIMIT_BYTES*0.95:
+            z = out_dir / f"{in_path.stem}_images_{fmt}_part{part_idx}.zip"
+            with ZipFile(z,'w',ZIP_DEFLATED) as zf:
+                for f in current: zf.write(f, arcname=f.name)
+            parts.append(z); part_idx += 1; current = [p]; current_size = s
+        else:
+            current.append(p); current_size += s
+    if current:
+        z = out_dir / f"{in_path.stem}_images_{fmt}_part{part_idx}.zip"
+        with ZipFile(z,'w',ZIP_DEFLATED) as zf:
+            for f in current: zf.write(f, arcname=f.name)
+        parts.append(z)
+    return parts
 
-async def audio_convert_ffmpeg(in_path: Path, out_dir: Path, target_ext: str) -> Path:
-    if not BIN["ffmpeg"]:
-        raise RuntimeError('لا يمكن تحويل الصوت/الفيديو لأن FFmpeg غير مثبت.')
-    target_ext = target_ext.lower()
-    out_path = out_dir / (in_path.stem + f'.{target_ext}')
-    if target_ext=='mp3': args = ['-vn','-c:a','libmp3lame','-q:a','2']
-    elif target_ext=='wav': args = ['-vn','-c:a','pcm_s16le']
-    elif target_ext=='ogg': args = ['-vn','-c:a','libvorbis','-q:a','5']
-    else: raise RuntimeError('صيغة صوت غير مدعومة')
-    code, out, err = await run_cmd([BIN["ffmpeg"],'-y','-i',str(in_path),*args,str(out_path)])
-    if code != 0: raise RuntimeError(f"FFmpeg فشل: {err or out}")
-    return out_path
+# ===== تخفيض الحجم عند الحاجة =====
+async def shrink_pdf(in_path: Path, out_dir: Path) -> Path | None:
+    if not BIN["gs"]:
+        return None
+    # جرّب /ebook ثم /screen
+    for preset in ('/ebook','/screen'):
+        out = out_dir / (in_path.stem + f'.min.pdf')
+        cmd = [BIN["gs"], '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4',
+               f'-dPDFSETTINGS={preset}', '-dNOPAUSE', '-dQUIET', '-dBATCH',
+               f'-sOutputFile={str(out)}', str(in_path)]
+        code, _, _ = await run_cmd(cmd)
+        if code==0 and out.exists() and out.stat().st_size < in_path.stat().st_size:
+            return out
+    return None
 
-async def video_to_mp4_ffmpeg(in_path: Path, out_dir: Path) -> Path:
+async def shrink_video(in_path: Path, out_dir: Path) -> Path | None:
     if not BIN["ffmpeg"]:
-        raise RuntimeError('لا يمكن تحويل الفيديو لأن FFmpeg غير مثبت.')
-    out_path = out_dir / (in_path.stem + '.mp4')
-    cmd = [BIN["ffmpeg"], '-y','-i',str(in_path), '-c:v','libx264','-preset','veryfast','-crf','23','-c:a','aac','-b:a','128k', str(out_path)]
-    code, out, err = await run_cmd(cmd)
-    if code != 0: raise RuntimeError(f"FFmpeg فشل: {err or out}")
-    return out_path
+        return None
+    trials = [
+        ['-vf','scale=\'min(1280,iw)\':-2','-c:v','libx264','-preset','veryfast','-crf','28','-c:a','aac','-b:a','96k'],
+        ['-vf','scale=\'min(854,iw)\':-2','-c:v','libx264','-preset','veryfast','-crf','30','-c:a','aac','-b:a','96k'],
+    ]
+    src = in_path
+    for i, args in enumerate(trials,1):
+        out = out_dir / (in_path.stem + f'.r{i}.mp4')
+        code, _, _ = await run_cmd([BIN["ffmpeg"],'-y','-i',str(src), *args, str(out)])
+        if code==0 and out.exists():
+            src = out
+            if size_ok(out): return out
+    return src if src!=in_path and size_ok(src) else None
+
+async def shrink_image(in_path: Path, out_dir: Path, ext: str) -> Path | None:
+    # خفّض الأبعاد إلى 2000 ثم 1400 مع جودة 85 ثم 75
+    for max_side, q in [(2000,85),(1400,75)]:
+        out = await image_to_image(in_path, out_dir, target_ext=ext, max_side=max_side, quality=q)
+        if size_ok(out): return out
+    return None
+
+async def shrink_audio(in_path: Path, out_dir: Path, ext: str) -> Path | None:
+    if not BIN["ffmpeg"]:
+        return None
+    out = out_dir / (in_path.stem + f'.{ext}')
+    if ext=='mp3':
+        args = ['-vn','-c:a','libmp3lame','-q:a','5']
+    elif ext=='ogg':
+        args = ['-vn','-c:a','libvorbis','-q:a','3']
+    elif ext=='wav':
+        # WAV غير مضغوط غالبًا؛ الأفضل تحويله إلى MP3
+        out = out_dir / (in_path.stem + '.mp3')
+        args = ['-vn','-c:a','libmp3lame','-q:a','5']
+    else:
+        return None
+    code, _, _ = await run_cmd([BIN["ffmpeg"],'-y','-i',str(in_path), *args, str(out)])
+    return out if code==0 and out.exists() else None
 
 # ===== Handlers =====
 HELP_TEXT = ("أرسل أي ملف (كـ *مستند* وليس صورة مضغوطة)\n"
@@ -257,35 +312,67 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         tgfile = await context.bot.get_file(file_id)
         await tgfile.download_to_drive(str(in_path))
 
-        out_path: Path | None = None
+        out_paths: list[Path] = []  # قد نرسل عدة ملفات
+        # 1) التحويل الأساسي
         if kind == 'office' and choice == 'PDF':
-            out_path = await office_to_pdf(in_path, workdir)
+            out = await office_to_pdf(in_path, workdir); out_paths = [out]
+
         elif kind == 'pdf' and choice == 'DOCX':
-            out_path = await pdf_to_docx(in_path, workdir)
+            out = await pdf_to_docx(in_path, workdir); out_paths = [out]
+
         elif kind == 'pdf' and choice == 'PNGZIP':
-            out_path = await pdf_to_images_zip(in_path, workdir, fmt='png')
+            out_paths = await pdf_to_images_zip_parts(in_path, workdir, fmt='png')
+
         elif kind == 'pdf' and choice == 'JPGZIP':
-            out_path = await pdf_to_images_zip(in_path, workdir, fmt='jpg')
+            out_paths = await pdf_to_images_zip_parts(in_path, workdir, fmt='jpg')
+
         elif kind == 'image' and choice == 'PDF':
-            out_path = await image_to_pdf(in_path, workdir)
+            out = await image_to_pdf(in_path, workdir); out_paths = [out]
+
         elif kind == 'image' and choice in {'JPG','PNG','WEBP'}:
-            out_path = await image_to_image(in_path, workdir, target_ext=choice.lower())
+            out = await image_to_image(in_path, workdir, target_ext=choice.lower()); out_paths = [out]
+
         elif kind == 'audio' and choice in {'MP3','WAV','OGG'}:
-            out_path = await audio_convert_ffmpeg(in_path, workdir, target_ext=choice.lower())
+            out = await audio_convert_ffmpeg(in_path, workdir, target_ext=choice.lower()); out_paths = [out]
+
         elif kind == 'video' and choice == 'MP4':
-            out_path = await video_to_mp4_ffmpeg(in_path, workdir)
+            out = await video_to_mp4_ffmpeg(in_path, workdir); out_paths = [out]
+
         else:
             raise RuntimeError('هذا التحويل غير مدعوم.')
 
-        if not out_path or not out_path.exists():
-            raise RuntimeError('فشل إنشاء الملف الناتج')
-        if not size_ok(out_path):
-            raise RuntimeError('حجم الملف الناتج أكبر من الحد المسموح.')
+        # 2) إذا أي ناتج تعدّى الحد: حاول تقليله
+        fixed: list[Path] = []
+        for p in out_paths:
+            if size_ok(p):
+                fixed.append(p); continue
+            # مسارات التخفيض حسب النوع
+            if p.suffix.lower()=='.pdf':
+                shr = await shrink_pdf(p, workdir)
+                if shr and size_ok(shr): fixed.append(shr)
+            elif p.suffix.lower()=='.mp4':
+                shr = await shrink_video(p, workdir)
+                if shr and size_ok(shr): fixed.append(shr)
+            elif p.suffix.lower() in {'.jpg','.jpeg','.png','.webp'}:
+                shr = await shrink_image(p, workdir, p.suffix.lstrip('.'))
+                if shr and size_ok(shr): fixed.append(shr)
+            elif p.suffix.lower() in {'.mp3','.wav','.ogg'}:
+                shr = await shrink_audio(p, workdir, p.suffix.lstrip('.'))
+                if shr and size_ok(shr): fixed.append(shr)
+            # ZIP لا يمكن ضغطه أكثر هنا (تقسيم الصفحات تم سابقًا)
+        # لو ما زال كبير، اتركه بدون إرسال
 
-        # أرسل الملف الصحيح (افتحه كـ rb)
-        with open(out_path, 'rb') as fh:
-            await query.message.reply_document(document=InputFile(fh, filename=out_path.name), caption='✔️ تم التحويل')
+        to_send = [p for p in (fixed or out_paths) if size_ok(p)]
+        if not to_send:
+            raise RuntimeError(f'الملف الناتج أكبر من حد تيليجرام ({TG_LIMIT_MB}MB). جرّب ملف أصغر أو اختر تحويلًا آخر.')
+
+        # 3) الإرسال (قد تكون عدة ملفات)
+        for idx, p in enumerate(to_send, 1):
+            cap = '✔️ تم التحويل' + (f' (جزء {idx}/{len(to_send)})' if len(to_send)>1 else '')
+            with open(p, 'rb') as fh:
+                await query.message.reply_document(document=InputFile(fh, filename=p.name), caption=cap)
         await query.edit_message_text('تم الإرسال ✅')
+
     except Exception as e:
         log.exception('conversion error')
         try: await query.edit_message_text(f'❌ فشل التحويل: {e}')
@@ -299,8 +386,10 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def make_web_app() -> web.Application:
     app = web.Application()
     async def health(_): return web.json_response({"ok": True, "service": "converter-bot"})
-    async def diag(_): return web.json_response({"soffice": BIN["soffice"], "pdftoppm": BIN["pdftoppm"], "ffmpeg": BIN["ffmpeg"]})
-    app.router.add_get('/health', health); app.router.add_get('/', health); app.router.add_get('/diag', diag)
+    async def diag(_): return web.json_response({"soffice": BIN["soffice"], "pdftoppm": BIN["pdftoppm"], "ffmpeg": BIN["ffmpeg"], "gs": BIN["gs"], "limit_mb": TG_LIMIT_MB})
+    app.router.add_get('/health', health)
+    app.router.add_get('/', health)
+    app.router.add_get('/diag', diag)
     return app
 
 async def on_startup_ptb(app: Application) -> None:
@@ -308,14 +397,16 @@ async def on_startup_ptb(app: Application) -> None:
     BIN["soffice"]  = which('soffice','libreoffice','lowriter')
     BIN["pdftoppm"] = which('pdftoppm')
     BIN["ffmpeg"]   = which('ffmpeg')
-    log.info(f"[bin] soffice={BIN['soffice']}, pdftoppm={BIN['pdftoppm']}, ffmpeg={BIN['ffmpeg']}")
+    BIN["gs"]       = which('gs','ghostscript')
+    log.info(f"[bin] soffice={BIN['soffice']}, pdftoppm={BIN['pdftoppm']}, ffmpeg={BIN['ffmpeg']}, gs={BIN['gs']} (limit={TG_LIMIT_MB}MB)")
 
-    # تشغيل خادم HTTP
+    # خادم HTTP
     webapp = await make_web_app()
     runner = web.AppRunner(webapp); await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT); await site.start()
     app.bot_data['web_runner'] = runner
 
+    # نظافة polling
     try: await app.bot.delete_webhook(drop_pending_updates=True)
     except: pass
     try:
