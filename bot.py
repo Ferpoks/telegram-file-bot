@@ -1011,11 +1011,12 @@ def build_app() -> Application:
 def main() -> None:
     app = build_app()
     if IS_WEBHOOK and PUBLIC_URL:
-        # PTB 22.x: استخدم webhook_url بدل url
+        # PTB 22.x: استخدم webhook_url + url_path (ليطابق المسار الذي يستقبله الخادم)
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
             webhook_url=f"{PUBLIC_URL}/webhook",
+            url_path="/webhook",
             secret_token=os.getenv("WEBHOOK_SECRET")  # اختياري
         )
     else:
