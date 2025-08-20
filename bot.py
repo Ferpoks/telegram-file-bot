@@ -18,7 +18,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
-import telegram
+import telegram  # لعرض نسخة المكتبة
 
 # ===================== إعدادات عامة =====================
 ENV_PATH = Path('.env')
@@ -38,15 +38,15 @@ ADMINS = {OWNER_ID} if OWNER_ID else set()
 
 OPS_PER_MINUTE = int(os.getenv('OPS_PER_MINUTE', '10'))
 
-# قناة الاشتراك الإجباري (username مع @ أو id -100...)
+# قناة الاشتراك الإجباري
 SUB_TARGET = (os.getenv('SUB_CHANNEL', '').strip() or '')
 SUB_CHAT_ID: Optional[int] = None
-SUB_USERNAME: Optional[str] = None  # مثل ferpoks
+SUB_USERNAME: Optional[str] = None
 
-# اسم مستخدم المدير لزر التراسل (بدون @)
+# اسم مستخدم المدير (بدون @) لزر التواصل
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', '').strip()
 
-# وضع الـ Webhook (لو PUBLIC_URL موجود)
+# وضع Webhook أو Polling
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()
 IS_WEBHOOK = bool(PUBLIC_URL)
 
@@ -62,7 +62,7 @@ BANNED: set[int] = set()
 STATS = {"ok": 0, "fail": 0, "bytes_in": 0, "bytes_out": 0, "started_at": int(time.time())}
 ACTIVE = {"office": 0, "pdf": 0, "media": 0, "image": 0}
 
-# حفظ اللغة المختارة + كل المستخدمين
+# حفظ اللغة المختارة + قائمة المستخدمين
 DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
 USERS_JSON = DATA_DIR / "users.json"
 try:
@@ -251,14 +251,12 @@ async def debugsub_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"resolved username = {SUB_USERNAME}")
     except Exception as e:
         lines.append(f"resolve error: {e}")
-
     try:
         cid = SUB_CHAT_ID or SUB_TARGET
         m = await context.bot.get_chat_member(cid, uid)
         lines.append(f"get_chat_member = OK, status={m.status}")
     except Exception as e:
         lines.append(f"get_chat_member = ERROR: {e}")
-
     await update.message.reply_text("\n".join(lines))
 
 # ===================== صلاحيات/حدود =====================
@@ -318,8 +316,8 @@ def options_for(kind: str, ext: str, token: str) -> list[list[InlineKeyboardButt
 # ===================== “توازي آمن” حسب النوع =====================
 CONC_OFFICE = int(os.getenv('CONC_OFFICE', '4'))   # ثقيل
 CONC_PDF    = int(os.getenv('CONC_PDF',    '6'))   # متوسط
-CONC_MEDIA  = int(os.getenv('CONC_MEDIA',  '4'))   # ثقيل (صوت/فيديو)
-CONC_IMAGE  = int(os.getenv('CONC_IMAGE',  '6'))   # خفيف
+CONC_MEDIA  = int(os.getenv('CONC_MEDIA',  '4'))   # صوت/فيديو
+CONC_IMAGE  = int(os.getenv('CONC_IMAGE',  '6'))   # صور
 
 sem_office = asyncio.Semaphore(CONC_OFFICE)
 sem_pdf    = asyncio.Semaphore(CONC_PDF)
@@ -446,7 +444,7 @@ async def video_to_mp4_ffmpeg(in_path: Path, out_dir: Path) -> Path:
     if code != 0: raise RuntimeError(f"FFmpeg فشل: {err or out}")
     return out_path
 
-# ===================== تخفيض الحجم عند الحاجة =====================
+# ===================== تقليل الحجم عند الحاجة =====================
 async def shrink_pdf(in_path: Path, out_dir: Path) -> Optional[Path]:
     if not BIN["gs"]:
         return None
@@ -926,14 +924,14 @@ async def on_startup_ptb(app: Application) -> None:
     BIN["gs"]       = which('gs','ghostscript')
     log.info(f"[bin] soffice={BIN['soffice']}, pdftoppm={BIN['pdftoppm']}, ffmpeg={BIN['ffmpeg']}, gs={BIN['gs']} (limit={TG_LIMIT_MB}MB)")
 
-    # في وضع Webhook لا نشغّل aiohttp على نفس المنفذ حتى لا يتعارض
+    # نشغّل /health فقط في وضع Polling حتى لا يتعارض مع Webhook على نفس المنفذ
     if not IS_WEBHOOK:
         webapp = await make_web_app()
         runner = web.AppRunner(webapp); await runner.setup()
         site = web.TCPSite(runner, '0.0.0.0', PORT); await site.start()
         app.bot_data['web_runner'] = runner
 
-    # تنظيف أي ويبهوك سابق (مفيد عند التحول بين الوضعين)
+    # تنظيف أي ويبهوك سابق عند بدء التشغيل
     try: await app.bot.delete_webhook(drop_pending_updates=True)
     except: pass
 
@@ -1013,15 +1011,14 @@ def build_app() -> Application:
 def main() -> None:
     app = build_app()
     if IS_WEBHOOK and PUBLIC_URL:
-        # Webhook mode (لا Polling ولا Updater داخلي)
+        # PTB 22.x: استخدم webhook_url بدل url
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            url=f"{PUBLIC_URL}/webhook",
+            webhook_url=f"{PUBLIC_URL}/webhook",
             secret_token=os.getenv("WEBHOOK_SECRET")  # اختياري
         )
     else:
-        # Polling (يعمل طبيعي على PTB 21+ حتى على Python 3.13)
         app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
