@@ -37,15 +37,19 @@ ADMINS = {OWNER_ID} if OWNER_ID else set()
 MAX_CONCURRENCY = int(os.getenv('MAX_CONCURRENCY', '2'))
 OPS_PER_MINUTE = int(os.getenv('OPS_PER_MINUTE', '10'))
 
-# قناة الاشتراك الإجباري
-SUB_CHANNEL = os.getenv('SUB_CHANNEL', '').strip()  # مثال: @mychannel أو -1001234567890
-ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', '').strip()  # بدون @ لزر التواصل
+# قناة الاشتراك الإجباري (اسم مستخدم مع @ أو id رقمي -100...)
+SUB_TARGET = (os.getenv('SUB_CHANNEL', '').strip() or '')
+SUB_CHAT_ID: int | None = None
+SUB_USERNAME: str | None = None  # مثل ferpoks
+
+# اسم مستخدم المدير لزر التراسل (بدون @)
+ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', '').strip()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 log = logging.getLogger('convbot')
 
 # ===================== حالات وتشخيص =====================
-PENDING: dict[str, dict] = {}
+PENDING: dict[str, dict] = {}                   # آخر ملف بانتظار الاختيار
 BIN = {"soffice": None, "pdftoppm": None, "ffmpeg": None, "gs": None}
 sem = asyncio.Semaphore(MAX_CONCURRENCY)
 USER_QPS: dict[int, deque] = defaultdict(deque)
@@ -74,6 +78,7 @@ IMG_EXTS = {"jpg", "jpeg", "png", "webp", "bmp", "tiff"}
 AUD_EXTS = {"mp3", "wav", "ogg", "m4a"}
 VID_EXTS = {"mp4", "mov", "mkv", "avi", "webm"}
 ALL_OFFICE = DOC_EXTS | PPT_EXTS | XLS_EXTS
+# ✅ إصلاح الـregex: باك سلاش واحد قبل الشرطة
 SAFE_CHARS = re.compile(r"[^A-Za-z0-9_.\- ]+")
 
 def safe_name(name: str, fallback: str = "file") -> str:
@@ -164,7 +169,102 @@ def menu_keyboard(uid:int):
         resize_keyboard=True
     )
 
-# ===================== صلاحيات/حدود/اشتراك =====================
+# ===================== اشتراك: حلّ القناة + تحقق =====================
+def _to_username(s: str) -> str | None:
+    s = (s or "").strip()
+    if not s:
+        return None
+    if s.startswith('@'): return s[1:]
+    if s.startswith('https://t.me/'): return s.rsplit('/', 1)[-1]
+    # اسم نظيف بدون @
+    return s
+
+async def resolve_subchat_id(bot) -> int | None:
+    """يحاول مرة واحدة جلب chat_id من username أو id، ويخزّنه."""
+    global SUB_CHAT_ID, SUB_USERNAME
+    if not SUB_TARGET:
+        return None
+    if SUB_CHAT_ID is not None:
+        return SUB_CHAT_ID
+    # جرّب باسم مستخدم
+    uname = _to_username(SUB_TARGET)
+    try:
+        if uname:
+            chat = await bot.get_chat(f"@{uname}")
+            SUB_CHAT_ID = chat.id
+            SUB_USERNAME = chat.username
+            return SUB_CHAT_ID
+    except Exception as e:
+        log.warning("resolve_subchat_id by username failed: %s", e)
+    # جرّب كـ id (مثل -100...)
+    try:
+        chat = await bot.get_chat(SUB_TARGET)
+        SUB_CHAT_ID = chat.id
+        SUB_USERNAME = chat.username
+        return SUB_CHAT_ID
+    except Exception as e:
+        log.warning("resolve_subchat_id by id failed: %s", e)
+        SUB_CHAT_ID = None
+        return None
+
+async def ensure_joined(bot, uid:int) -> bool:
+    """True إذا مشترك، False إذا غير ذلك أو فشلنا في الوصول للقناة."""
+    if not SUB_TARGET:
+        return True
+    chat_id = await resolve_subchat_id(bot)
+    if chat_id is None:
+        # غالبًا البوت ليس أدمن بالقناة
+        log.warning("ensure_joined: cannot resolve channel (bot probably not admin in the channel).")
+        return False
+    try:
+        member: ChatMember = await bot.get_chat_member(chat_id, uid)
+        return member.status not in ("left","kicked")
+    except Exception as e:
+        log.warning("ensure_joined error: %s", e)
+        return False
+
+async def gate_or_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """يرجع True إذا مسموح، وإلا يرسل رسالة الاشتراك ويرجع False."""
+    if not SUB_TARGET:
+        return True
+    uid = update.effective_user.id if update.effective_user else 0
+    ok = await ensure_joined(context.bot, uid)
+    if ok:
+        return True
+    # زر الاشتراك + تحقق
+    uname = SUB_USERNAME or _to_username(SUB_TARGET)
+    join_url = f"https://t.me/{uname}" if uname else None
+    lang = user_lang(uid)
+    buttons = []
+    if join_url:
+        buttons.append([InlineKeyboardButton(LANGS[lang]["join_btn"], url=join_url)])
+    buttons.append([InlineKeyboardButton(LANGS[lang]["check_btn"], callback_data="chk:join")])
+    await (update.effective_message or update.message).reply_text(
+        LANGS[lang]["must_join"], reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return False
+
+# ========== أمر تشخيص الاشتراك ==========
+async def debugsub_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    lines = [f"SUB_TARGET = {SUB_TARGET!r}"]
+    try:
+        cid = await resolve_subchat_id(context.bot)
+        lines.append(f"resolved chat_id = {cid}")
+        lines.append(f"resolved username = {SUB_USERNAME}")
+    except Exception as e:
+        lines.append(f"resolve error: {e}")
+
+    try:
+        cid = SUB_CHAT_ID or SUB_TARGET
+        m = await context.bot.get_chat_member(cid, uid)
+        lines.append(f"get_chat_member = OK, status={m.status}")
+    except Exception as e:
+        lines.append(f"get_chat_member = ERROR: {e}")
+
+    await update.message.reply_text("\n".join(lines))
+
+# ===================== صلاحيات/حدود =====================
 def is_admin(uid: int) -> bool:
     return uid in ADMINS
 
@@ -179,36 +279,6 @@ def allow(uid: int) -> bool:
     if len(dq) >= OPS_PER_MINUTE:
         return False
     dq.append(now); return True
-
-async def ensure_joined(bot, uid:int) -> bool:
-    if not SUB_CHANNEL:
-        return True
-    try:
-        member: ChatMember = await bot.get_chat_member(SUB_CHANNEL, uid)
-        return member.status not in ("left","kicked")
-    except Exception as e:
-        # غالبًا البوت ليس أدمن بالقناة
-        log.warning("ensure_joined error: %s", e)
-        return False
-
-async def gate_or_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """يرجع True إذا مسموح، وإلا يرسل رسالة الاشتراك ويرجع False"""
-    if not SUB_CHANNEL:
-        return True
-    uid = update.effective_user.id if update.effective_user else 0
-    ok = await ensure_joined(context.bot, uid)
-    if ok:
-        return True
-    lang = user_lang(uid)
-    join_url = f"https://t.me/{SUB_CHANNEL.lstrip('@')}" if SUB_CHANNEL.startswith("@") else None
-    buttons = [
-        [InlineKeyboardButton(LANGS[lang]["join_btn"], url=join_url or "https://t.me")],
-        [InlineKeyboardButton(LANGS[lang]["check_btn"], callback_data="chk:join")],
-    ]
-    await (update.effective_message or update.message).reply_text(
-        LANGS[lang]["must_join"], reply_markup=InlineKeyboardMarkup(buttons)
-    )
-    return False
 
 # ===================== كشف النوع وبناء الأزرار =====================
 def kind_for_extension(ext: str) -> str:
@@ -336,7 +406,7 @@ async def audio_convert_ffmpeg(in_path: Path, out_dir: Path, target_ext: str) ->
     target_ext = target_ext.lower()
     out_path = out_dir / (in_path.stem + f'.{target_ext}')
     if target_ext=='mp3':
-        args = ['-vn','-c:a','libmp3lame','-q:a','2']
+        args = ['-vn','-c:a','libmp3lame','-q:a','2']  # جودة عالية
     elif target_ext=='wav':
         args = ['-vn','-c:a','pcm_s16le']
     elif target_ext=='ogg':
@@ -352,7 +422,7 @@ async def video_to_mp4_ffmpeg(in_path: Path, out_dir: Path) -> Path:
         raise RuntimeError('FFmpeg غير متوفر.')
     out_path = out_dir / (in_path.stem + '.mp4')
     cmd = [BIN["ffmpeg"], '-y','-i',str(in_path),
-           '-c:v','libx264','-preset','veryfast','-crf','23',
+           '-c:v','libx264','-preset','veryfast','-crf','23',   # جودة ممتازة وحجم مناسب
            '-c:a','aac','-b:a','128k', str(out_path)]
     code, out, err = await run_cmd(cmd)
     if code != 0: raise RuntimeError(f"FFmpeg فشل: {err or out}")
@@ -447,14 +517,15 @@ async def on_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if code not in ("ar","en"): return
     uid = q.from_user.id
     set_user_lang(uid, code)
-    if SUB_CHANNEL:
+    if SUB_TARGET:
         ok = await ensure_joined(context.bot, uid)
         if not ok:
-            join_url = f"https://t.me/{SUB_CHANNEL.lstrip('@')}" if SUB_CHANNEL.startswith("@") else None
-            buttons = [
-                [InlineKeyboardButton(LANGS[code]["join_btn"], url=join_url or "https://t.me")],
-                [InlineKeyboardButton(LANGS[code]["check_btn"], callback_data="chk:join")],
-            ]
+            uname = SUB_USERNAME or _to_username(SUB_TARGET)
+            join_url = f"https://t.me/{uname}" if uname else None
+            buttons = []
+            if join_url:
+                buttons.append([InlineKeyboardButton(LANGS[code]["join_btn"], url=join_url)])
+            buttons.append([InlineKeyboardButton(LANGS[code]["check_btn"], callback_data="chk:join")])
             return await q.edit_message_text(LANGS[code]["must_join"], reply_markup=InlineKeyboardMarkup(buttons))
     await q.edit_message_text(LANGS[code]["start"])
     try:
@@ -614,9 +685,6 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         PENDING.pop(token, None)
 
 # ===================== Handlers (مدير) =====================
-def is_admin(uid: int) -> bool:
-    return uid in ADMINS
-
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else 0
     if not is_admin(uid):
@@ -675,7 +743,6 @@ async def formats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     uid = update.effective_user.id if update.effective_user else 0
     if not is_admin(uid):
         return await update.message.reply_text(t(uid,"admin_only"))
-    # يعرض تلخيص الصيغ المتاحة (للمدير فقط)
     await update.message.reply_text(
         "🧾 الصيغ المدعومة (Admin):\n"
         "• Office → PDF (DOC/DOCX/RTF/ODT/PPT/PPTX/XLS/XLSX)\n"
@@ -690,7 +757,7 @@ async def formats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def make_web_app() -> web.Application:
     app = web.Application()
     async def health(_): return web.json_response({"ok": True, "service": "converter-bot"})
-    async def diag(_): return web.json_response({"soffice": BIN["soffice"], "pdftoppm": BIN["pdftoppm"], "ffmpeg": BIN["ffmpeg"], "gs": BIN["gs"], "limit_mb": TG_LIMIT_MB})
+    async def diag(_): return web.json_response({"soffice": BIN["soffice"], "pdftoppm": BIN["pdftoppm"], "ffmpeg": BIN["ffmpeg"], "gs": BIN["gs"], "limit_mb": TG_LIMIT_MB, "sub_target": SUB_TARGET, "sub_chat_id": SUB_CHAT_ID})
     app.router.add_get('/health', health)
     app.router.add_get('/', health)
     app.router.add_get('/diag', diag)
@@ -708,10 +775,11 @@ async def on_startup_ptb(app: Application) -> None:
     site = web.TCPSite(runner, '0.0.0.0', PORT); await site.start()
     app.bot_data['web_runner'] = runner
 
+    # polling
     try: await app.bot.delete_webhook(drop_pending_updates=True)
     except: pass
 
-    # لا نعرض /formats ضمن الأوامر العامة حتى لا يظهر للمستخدمين
+    # لا نعرض /formats ضمن الأوامر العامة
     try:
         await app.bot.set_my_commands([
             BotCommand("start","Start / ابدأ"),
@@ -768,6 +836,8 @@ def build_app() -> Application:
     application.add_handler(CommandHandler('setlimit', setlimit_cmd))
     application.add_handler(CommandHandler('ban', ban_cmd))
     application.add_handler(CommandHandler('unban', unban_cmd))
+    # تشخيص الاشتراك
+    application.add_handler(CommandHandler('debugsub', debugsub_cmd))
     # أخطاء عامة
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception('Unhandled error: %s', context.error)
@@ -780,4 +850,5 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
 
