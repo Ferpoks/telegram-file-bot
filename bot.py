@@ -48,14 +48,17 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(na
 log = logging.getLogger('convbot')
 
 # ===================== حالات وتشخيص =====================
-# نحفظ الطلبات عبر token آمن داخل callback لتفادي تعارض التوازي
+# الطلبات تُعرّف بتوكن داخل callback لتفادي التعارض
 PENDING: dict[str, dict] = {}
 BIN = {"soffice": None, "pdftoppm": None, "ffmpeg": None, "gs": None}
 USER_QPS: dict[int, deque] = defaultdict(deque)
 BANNED: set[int] = set()
 STATS = {"ok": 0, "fail": 0, "bytes_in": 0, "bytes_out": 0, "started_at": int(time.time())}
 
-# حفظ اللغة المختارة
+# نشاط حي لكل نوع (لأوامر المدير)
+ACTIVE = {"office": 0, "pdf": 0, "media": 0, "image": 0}
+
+# حفظ اللغة المختارة + كل المستخدمين
 DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
 USERS_JSON = DATA_DIR / "users.json"
 try:
@@ -284,32 +287,33 @@ def kind_for_extension(ext: str) -> str:
     if ext == 'pdf': return 'pdf'
     return 'unknown'
 
+def cb_build(token: str, code: str) -> str:
+    return f'c:{token}:{code}'
+
 def options_for(kind: str, ext: str, token: str) -> list[list[InlineKeyboardButton]]:
     btns: list[list[InlineKeyboardButton]] = []
-    def cb(code: str) -> str:
-        return f'c:{token}:{code}'
     if kind == 'office':
         if BIN["soffice"]:
-            btns.append([InlineKeyboardButton('تحويل إلى PDF', callback_data=cb('PDF'))])
+            btns.append([InlineKeyboardButton('تحويل إلى PDF', callback_data=cb_build(token,'PDF'))])
     elif kind == 'pdf':
-        btns.append([InlineKeyboardButton('PDF → DOCX', callback_data=cb('DOCX'))])
+        btns.append([InlineKeyboardButton('PDF → DOCX', callback_data=cb_build(token,'DOCX'))])
         btns.append([
-            InlineKeyboardButton('PDF → صور PNG (ZIP)', callback_data=cb('PNGZIP')),
-            InlineKeyboardButton('PDF → صور JPG (ZIP)',  callback_data=cb('JPGZIP')),
+            InlineKeyboardButton('PDF → صور PNG (ZIP)', callback_data=cb_build(token,'PNGZIP')),
+            InlineKeyboardButton('PDF → صور JPG (ZIP)',  callback_data=cb_build(token,'JPGZIP')),
         ])
     elif kind == 'image':
-        row1 = [InlineKeyboardButton('إلى PDF', callback_data=cb('PDF'))]
+        row1 = [InlineKeyboardButton('إلى PDF', callback_data=cb_build(token,'PDF'))]
         targets = ['JPG','PNG','WEBP']
-        row2 = [InlineKeyboardButton(f'إلى {t}', callback_data=cb(t)) for t in targets if t.lower()!=ext]
+        row2 = [InlineKeyboardButton(f'إلى {t}', callback_data=cb_build(token,t)) for t in targets if t.lower()!=ext]
         btns.append(row1)
         if row2: btns.append(row2)
     elif kind == 'audio':
         if BIN["ffmpeg"]:
-            row = [InlineKeyboardButton(f'إلى {t}', callback_data=cb(t)) for t in ['MP3','WAV','OGG'] if t.lower()!=ext]
+            row = [InlineKeyboardButton(f'إلى {t}', callback_data=cb_build(token,t)) for t in ['MP3','WAV','OGG'] if t.lower()!=ext]
             if row: btns.append(row)
     elif kind == 'video':
         if BIN["ffmpeg"]:
-            btns.append([InlineKeyboardButton('إلى MP4', callback_data=cb('MP4'))])
+            btns.append([InlineKeyboardButton('إلى MP4', callback_data=cb_build(token,'MP4'))])
     return btns
 
 # ===================== “توازي آمن” حسب النوع =====================
@@ -323,12 +327,12 @@ sem_pdf    = asyncio.Semaphore(CONC_PDF)
 sem_media  = asyncio.Semaphore(CONC_MEDIA)
 sem_image  = asyncio.Semaphore(CONC_IMAGE)
 
-def select_sem(kind: str, choice: str):
-    if kind == 'office': return sem_office
-    if kind == 'pdf':    return sem_pdf
-    if kind in ('audio','video'): return sem_media
-    if kind == 'image':  return sem_image
-    return sem_pdf
+def select_sem(kind: str) -> tuple[asyncio.Semaphore, str]:
+    if kind == 'office': return sem_office, 'office'
+    if kind == 'pdf':    return sem_pdf, 'pdf'
+    if kind in ('audio','video'): return sem_media, 'media'
+    if kind == 'image':  return sem_image, 'image'
+    return sem_pdf, 'pdf'
 
 # ===================== وظائف التحويل =====================
 async def office_to_pdf(in_path: Path, out_dir: Path) -> Path:
@@ -502,14 +506,8 @@ async def choose_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id if update.effective_user else 0
-    if str(uid) not in USERS:
-        await choose_lang(update, context); return
-    if not await gate_or_prompt(update, context):
-        return
-    await update.message.reply_text(
-        t(uid,"start"), reply_markup=menu_keyboard(uid), disable_web_page_preview=True
-    )
+    # ✅ دائمًا نعرض اختيار اللغة عند /start
+    await choose_lang(update, context)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id if update.effective_user else 0
@@ -572,6 +570,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await msg.reply_text(t(uid,"rate_limited")); return
     if not await gate_or_prompt(update, context):
         return
+
+    # خزّن المستخدم لو جديد (لازم للبث لاحقًا)
+    USERS.setdefault(str(uid), {}).setdefault("lang", "ar"); save_users()
 
     if msg.document:
         file_id = msg.document.file_id; file_name = msg.document.file_name or 'file'
@@ -640,68 +641,72 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await query.edit_message_text('⏳ جارٍ التحويل...')
     workdir = Path(tempfile.mkdtemp(prefix='convbot_'))
     try:
-        sem = select_sem(kind, choice)
+        sem, cat = select_sem(kind)
         async with sem:
-            try: await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-            except: pass
-
-            in_path = workdir / safe_name(file_name or 'file')
-            tgfile = await context.bot.get_file(file_id)
-            await tgfile.download_to_drive(str(in_path))
-            try: STATS["bytes_in"] += in_path.stat().st_size
-            except: pass
-
-            out_paths: list[Path] = []
-
-            if kind == 'office' and choice == 'PDF':
-                out_paths = [await office_to_pdf(in_path, workdir)]
-            elif kind == 'pdf' and choice == 'DOCX':
-                out_paths = [await pdf_to_docx(in_path, workdir)]
-            elif kind == 'pdf' and choice == 'PNGZIP':
-                out_paths = await pdf_to_images_zip_parts(in_path, workdir, fmt='png')
-            elif kind == 'pdf' and choice == 'JPGZIP':
-                out_paths = await pdf_to_images_zip_parts(in_path, workdir, fmt='jpg')
-            elif kind == 'image' and choice == 'PDF':
-                out_paths = [await image_to_pdf(in_path, workdir)]
-            elif kind == 'image' and choice in {'JPG','PNG','WEBP'}:
-                out_paths = [await image_to_image(in_path, workdir, target_ext=choice.lower())]
-            elif kind == 'audio' and choice in {'MP3','WAV','OGG'}:
-                out_paths = [await audio_convert_ffmpeg(in_path, workdir, target_ext=choice.lower())]
-            elif kind == 'video' and choice == 'MP4':
-                out_paths = [await video_to_mp4_ffmpeg(in_path, workdir)]
-            else:
-                raise RuntimeError('تحويل غير مدعوم.')
-
-            fixed: list[Path] = []
-            for p in out_paths:
-                if size_ok(p):
-                    fixed.append(p); continue
-                if p.suffix.lower()=='.pdf':
-                    shr = await shrink_pdf(p, workdir)
-                    if shr and size_ok(shr): fixed.append(shr)
-                elif p.suffix.lower()=='.mp4':
-                    shr = await shrink_video(p, workdir)
-                    if shr and size_ok(shr): fixed.append(shr)
-                elif p.suffix.lower() in {'.jpg','.jpeg','.png','.webp'}:
-                    shr = await shrink_image(p, workdir, p.suffix.lstrip('.'))
-                    if shr and size_ok(shr): fixed.append(shr)
-                elif p.suffix.lower() in {'.mp3','.wav','.ogg'}:
-                    shr = await shrink_audio(p, workdir, p.suffix.lstrip('.'))
-                    if shr and size_ok(shr): fixed.append(shr)
-
-            to_send = [p for p in (fixed or out_paths) if size_ok(p)]
-            if not to_send:
-                raise RuntimeError(t(uid,"too_big").format(mb=TG_LIMIT_MB))
-
-            for idx, p in enumerate(to_send, 1):
-                cap = t(uid,"conv_done") + (f' (جزء {idx}/{len(to_send)})' if len(to_send)>1 else '')
-                with open(p, 'rb') as fh:
-                    await query.message.reply_document(document=InputFile(fh, filename=p.name), caption=cap)
-                try: STATS["bytes_out"] += p.stat().st_size
+            ACTIVE[cat] += 1
+            try:
+                try: await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
                 except: pass
 
-            STATS["ok"] += 1
-            await query.edit_message_text('تم الإرسال ✅')
+                in_path = workdir / safe_name(file_name or 'file')
+                tgfile = await context.bot.get_file(file_id)
+                await tgfile.download_to_drive(str(in_path))
+                try: STATS["bytes_in"] += in_path.stat().st_size
+                except: pass
+
+                out_paths: list[Path] = []
+
+                if kind == 'office' and choice == 'PDF':
+                    out_paths = [await office_to_pdf(in_path, workdir)]
+                elif kind == 'pdf' and choice == 'DOCX':
+                    out_paths = [await pdf_to_docx(in_path, workdir)]
+                elif kind == 'pdf' and choice == 'PNGZIP':
+                    out_paths = await pdf_to_images_zip_parts(in_path, workdir, fmt='png')
+                elif kind == 'pdf' and choice == 'JPGZIP':
+                    out_paths = await pdf_to_images_zip_parts(in_path, workdir, fmt='jpg')
+                elif kind == 'image' and choice == 'PDF':
+                    out_paths = [await image_to_pdf(in_path, workdir)]
+                elif kind == 'image' and choice in {'JPG','PNG','WEBP'}:
+                    out_paths = [await image_to_image(in_path, workdir, target_ext=choice.lower())]
+                elif kind == 'audio' and choice in {'MP3','WAV','OGG'}:
+                    out_paths = [await audio_convert_ffmpeg(in_path, workdir, target_ext=choice.lower())]
+                elif kind == 'video' and choice == 'MP4':
+                    out_paths = [await video_to_mp4_ffmpeg(in_path, workdir)]
+                else:
+                    raise RuntimeError('تحويل غير مدعوم.')
+
+                fixed: list[Path] = []
+                for p in out_paths:
+                    if size_ok(p):
+                        fixed.append(p); continue
+                    if p.suffix.lower()=='.pdf':
+                        shr = await shrink_pdf(p, workdir)
+                        if shr and size_ok(shr): fixed.append(shr)
+                    elif p.suffix.lower()=='.mp4':
+                        shr = await shrink_video(p, workdir)
+                        if shr and size_ok(shr): fixed.append(shr)
+                    elif p.suffix.lower() in {'.jpg','.jpeg','.png','.webp'}:
+                        shr = await shrink_image(p, workdir, p.suffix.lstrip('.'))
+                        if shr and size_ok(shr): fixed.append(shr)
+                    elif p.suffix.lower() in {'.mp3','.wav','.ogg'}:
+                        shr = await shrink_audio(p, workdir, p.suffix.lstrip('.'))
+                        if shr and size_ok(shr): fixed.append(shr)
+
+                to_send = [p for p in (fixed or out_paths) if size_ok(p)]
+                if not to_send:
+                    raise RuntimeError(t(uid,"too_big").format(mb=TG_LIMIT_MB))
+
+                for idx, p in enumerate(to_send, 1):
+                    cap = t(uid,"conv_done") + (f' (جزء {idx}/{len(to_send)})' if len(to_send)>1 else '')
+                    with open(p, 'rb') as fh:
+                        await query.message.reply_document(document=InputFile(fh, filename=p.name), caption=cap)
+                    try: STATS["bytes_out"] += p.stat().st_size
+                    except: pass
+
+                STATS["ok"] += 1
+                await query.edit_message_text('تم الإرسال ✅')
+            finally:
+                ACTIVE[cat] -= 1
 
     except Exception as e:
         STATS["fail"] += 1
@@ -725,7 +730,8 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- الحد: {TG_LIMIT_MB}MB | OPS/min: {OPS_PER_MINUTE}\n"
         f"- تشغيل منذ: {up//3600}h {(up%3600)//60}m\n"
         f"- محظورون: {len(BANNED)}\n"
-        f"- توازي: office={CONC_OFFICE}, pdf={CONC_PDF}, media={CONC_MEDIA}, image={CONC_IMAGE}"
+        f"- توازي: office={CONC_OFFICE}, pdf={CONC_PDF}, media={CONC_MEDIA}, image={CONC_IMAGE}\n"
+        f"- نشط: office={ACTIVE['office']}, pdf={ACTIVE['pdf']}, media={ACTIVE['media']}, image={ACTIVE['image']}"
     )
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -752,6 +758,53 @@ async def setlimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("قيمة غير صالحة.")
 
+async def setops_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid): return await update.message.reply_text(t(uid,"admin_only"))
+    if not context.args: return await update.message.reply_text("استخدم: /setops <محاولات بالدقيقة>")
+    try:
+        n = int(context.args[0]); 
+        if n < 1: raise ValueError()
+        global OPS_PER_MINUTE; OPS_PER_MINUTE = n
+        await update.message.reply_text(f"✅ OPS_PER_MINUTE = {n}")
+    except:
+        await update.message.reply_text("قيمة غير صالحة.")
+
+async def setconc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid): return await update.message.reply_text(t(uid,"admin_only"))
+    if len(context.args) != 2:
+        return await update.message.reply_text("استخدم: /setconc <office|pdf|media|image> <N>")
+    kind, n = context.args[0].lower(), context.args[1]
+    try:
+        n = int(n); 
+        if n < 0: raise ValueError()
+    except:
+        return await update.message.reply_text("قيمة غير صالحة.")
+    global CONC_OFFICE, CONC_PDF, CONC_MEDIA, CONC_IMAGE, sem_office, sem_pdf, sem_media, sem_image
+    if kind == 'office':
+        CONC_OFFICE = n; sem_office = asyncio.Semaphore(CONC_OFFICE)
+    elif kind == 'pdf':
+        CONC_PDF = n; sem_pdf = asyncio.Semaphore(CONC_PDF)
+    elif kind == 'media':
+        CONC_MEDIA = n; sem_media = asyncio.Semaphore(CONC_MEDIA)
+    elif kind == 'image':
+        CONC_IMAGE = n; sem_image = asyncio.Semaphore(CONC_IMAGE)
+    else:
+        return await update.message.reply_text("النوع غير معروف.")
+    await update.message.reply_text(f"✅ setconc {kind} = {n} (سيُطبّق على المهام الجديدة)")
+
+async def active_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid): return await update.message.reply_text(t(uid,"admin_only"))
+    await update.message.reply_text(
+        "🔎 النشاط الحالي\n"
+        f"- office: {ACTIVE['office']}/{CONC_OFFICE}\n"
+        f"- pdf:    {ACTIVE['pdf']}/{CONC_PDF}\n"
+        f"- media:  {ACTIVE['media']}/{CONC_MEDIA}\n"
+        f"- image:  {ACTIVE['image']}/{CONC_IMAGE}"
+    )
+
 async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else 0
     if not is_admin(uid): return await update.message.reply_text(t(uid,"admin_only"))
@@ -767,6 +820,77 @@ async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         BANNED.discard(int(context.args[0])); await update.message.reply_text("تم إلغاء الحظر ✅")
     except: await update.message.reply_text("user_id غير صالح.")
+
+async def banlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid): return await update.message.reply_text(t(uid,"admin_only"))
+    if not BANNED:
+        return await update.message.reply_text("لا يوجد محظورون.")
+    await update.message.reply_text("المحظورون:\n" + "\n".join(map(str, sorted(BANNED))))
+
+async def setsub_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid): return await update.message.reply_text(t(uid,"admin_only"))
+    global SUB_TARGET, SUB_CHAT_ID, SUB_USERNAME
+    if not context.args:
+        return await update.message.reply_text(f"SUB_CHANNEL الحالي: {SUB_TARGET!r} (chat_id={SUB_CHAT_ID})")
+    SUB_TARGET = " ".join(context.args).strip()
+    SUB_CHAT_ID = None; SUB_USERNAME = None
+    await update.message.reply_text(f"✅ SUB_CHANNEL = {SUB_TARGET}. سيُعاد حلّها تلقائيًا.")
+
+async def addadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if uid != OWNER_ID:  # فقط المالك يضيف/يحذف مشرفين
+        return await update.message.reply_text("هذا الأمر للمالك فقط.")
+    if not context.args: return await update.message.reply_text("استخدم: /addadmin <user_id>")
+    try:
+        ADMINS.add(int(context.args[0])); await update.message.reply_text("تمت إضافة المشرف ✅")
+    except: await update.message.reply_text("user_id غير صالح.")
+
+async def deladmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if uid != OWNER_ID:
+        return await update.message.reply_text("هذا الأمر للمالك فقط.")
+    if not context.args: return await update.message.reply_text("استخدم: /deladmin <user_id>")
+    try:
+        ADMINS.discard(int(context.args[0])); await update.message.reply_text("تم حذف المشرف ✅")
+    except: await update.message.reply_text("user_id غير صالح.")
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid): return await update.message.reply_text(t(uid,"admin_only"))
+    text = " ".join(context.args).strip()
+    if not text:
+        return await update.message.reply_text("استخدم: /broadcast <نص>")
+    ok = 0; fail = 0
+    for k in list(USERS.keys()):
+        try:
+            chat_id = int(k)
+            await context.bot.send_message(chat_id, text)
+            ok += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            fail += 1
+    await update.message.reply_text(f"تم الإرسال: {ok} | فشل: {fail}")
+
+async def adminhelp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid): return await update.message.reply_text(t(uid,"admin_only"))
+    await update.message.reply_text(
+        "أوامر المدير:\n"
+        "/admin – لوحة معلومات\n"
+        "/stats – إحصاءات\n"
+        "/active – النشاط الحالي\n"
+        "/setconc <office|pdf|media|image> <N> – تعديل التوازي\n"
+        "/setops <N> – تعديل محاولات/دقيقة\n"
+        "/setlimit <MB> – حد حجم الإرسال\n"
+        "/setsub <@channel|-100id> – قناة الاشتراك\n"
+        "/addadmin <user_id>, /deladmin <user_id>\n"
+        "/ban <user_id>, /unban <user_id>, /banlist\n"
+        "/broadcast <نص>\n"
+        "/formats – الصيغ المدعومة (عرض فقط)\n"
+        "/debugsub – تشخيص الاشتراك"
+    )
 
 # ========= /formats للمدير فقط =========
 async def formats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -788,9 +912,10 @@ async def make_web_app() -> web.Application:
     app = web.Application()
     async def health(_): return web.json_response({"ok": True, "service": "converter-bot"})
     async def diag(_): return web.json_response({
-        "soffice": BIN["soffice"], "pdftoppm": BIN["pdftoppm"], "ffmpeg": BIN["ffmpeg"], "gs": BIN["gs"],
+        "soice": BIN["soffice"], "pdftoppm": BIN["pdftoppm"], "ffmpeg": BIN["ffmpeg"], "gs": BIN["gs"],
         "limit_mb": TG_LIMIT_MB, "sub_target": SUB_TARGET, "sub_chat_id": SUB_CHAT_ID,
-        "conc": {"office": CONC_OFFICE, "pdf": CONC_PDF, "media": CONC_MEDIA, "image": CONC_IMAGE}
+        "conc": {"office": CONC_OFFICE, "pdf": CONC_PDF, "media": CONC_MEDIA, "image": CONC_IMAGE},
+        "active": ACTIVE
     })
     app.router.add_get('/health', health)
     app.router.add_get('/', health)
@@ -863,12 +988,21 @@ def build_app() -> Application:
     application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VIDEO, handle_file))
     application.add_handler(CallbackQueryHandler(on_choice, pattern=r'^c:'))
     # المدير
-    application.add_handler(CommandHandler('formats', formats_cmd))
+    application.add_handler(CommandHandler('adminhelp', adminhelp_cmd))
     application.add_handler(CommandHandler('admin', admin_cmd))
     application.add_handler(CommandHandler('stats', stats_cmd))
+    application.add_handler(CommandHandler('active', active_cmd))
+    application.add_handler(CommandHandler('setconc', setconc_cmd))
+    application.add_handler(CommandHandler('setops', setops_cmd))
     application.add_handler(CommandHandler('setlimit', setlimit_cmd))
     application.add_handler(CommandHandler('ban', ban_cmd))
     application.add_handler(CommandHandler('unban', unban_cmd))
+    application.add_handler(CommandHandler('banlist', banlist_cmd))
+    application.add_handler(CommandHandler('setsub', setsub_cmd))
+    application.add_handler(CommandHandler('addadmin', addadmin_cmd))
+    application.add_handler(CommandHandler('deladmin', deladmin_cmd))
+    application.add_handler(CommandHandler('broadcast', broadcast_cmd))
+    application.add_handler(CommandHandler('formats', formats_cmd))
     # تشخيص الاشتراك
     application.add_handler(CommandHandler('debugsub', debugsub_cmd))
     # أخطاء عامة
@@ -883,5 +1017,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-
-
