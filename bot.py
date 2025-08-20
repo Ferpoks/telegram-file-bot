@@ -18,7 +18,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
-import telegram  # لعرض نسخة المكتبة في اللوج
+import telegram
 
 # ===================== إعدادات عامة =====================
 ENV_PATH = Path('.env')
@@ -46,12 +46,15 @@ SUB_USERNAME: Optional[str] = None  # مثل ferpoks
 # اسم مستخدم المدير لزر التراسل (بدون @)
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', '').strip()
 
+# وضع الـ Webhook (لو PUBLIC_URL موجود)
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()
+IS_WEBHOOK = bool(PUBLIC_URL)
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 log = logging.getLogger('convbot')
 log.info(f"PTB version at runtime: {telegram.__version__}")
 
 # ===================== حالات وتشخيص =====================
-# الطلبات تُعرّف بتوكن داخل callback لتفادي التعارض
 PENDING: dict[str, dict] = {}
 BIN = {"soffice": None, "pdftoppm": None, "ffmpeg": None, "gs": None}
 USER_QPS: dict[int, deque] = defaultdict(deque)
@@ -181,13 +184,11 @@ def _to_username(s: str) -> Optional[str]:
     return s
 
 async def resolve_subchat_id(bot) -> Optional[int]:
-    """يحاول مرة واحدة جلب chat_id من username أو id، ويخزّنه."""
     global SUB_CHAT_ID, SUB_USERNAME
     if not SUB_TARGET:
         return None
     if SUB_CHAT_ID is not None:
         return SUB_CHAT_ID
-    # جرّب باسم مستخدم
     uname = _to_username(SUB_TARGET)
     try:
         if uname:
@@ -197,7 +198,6 @@ async def resolve_subchat_id(bot) -> Optional[int]:
             return SUB_CHAT_ID
     except Exception as e:
         log.warning("resolve_subchat_id by username failed: %s", e)
-    # جرّب كـ id (مثل -100...)
     try:
         chat = await bot.get_chat(SUB_TARGET)
         SUB_CHAT_ID = chat.id
@@ -209,7 +209,6 @@ async def resolve_subchat_id(bot) -> Optional[int]:
         return None
 
 async def ensure_joined(bot, uid:int) -> bool:
-    """True إذا مشترك، False إذا غير ذلك أو فشلنا في الوصول للقناة."""
     if not SUB_TARGET:
         return True
     chat_id = await resolve_subchat_id(bot)
@@ -224,7 +223,6 @@ async def ensure_joined(bot, uid:int) -> bool:
         return False
 
 async def gate_or_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """يرجع True إذا مسموح، وإلا يرسل رسالة الاشتراك ويرجع False."""
     if not SUB_TARGET:
         return True
     uid = update.effective_user.id if update.effective_user else 0
@@ -507,7 +505,6 @@ async def choose_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # ✅ دائمًا نعرض اختيار اللغة عند /start
     await choose_lang(update, context)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -572,7 +569,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not await gate_or_prompt(update, context):
         return
 
-    # خزّن المستخدم لو جديد (لازم للبث لاحقًا)
     USERS.setdefault(str(uid), {}).setdefault("lang", "ar"); save_users()
 
     if msg.document:
@@ -613,7 +609,6 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return await on_check_join(update, context)
     if not data.startswith('c:'): return
 
-    # c:{token}:{choice}
     try:
         _, token, choice = data.split(':', 2)
     except ValueError:
@@ -841,7 +836,7 @@ async def setsub_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def addadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else 0
-    if uid != OWNER_ID:  # فقط المالك يضيف/يحذف مشرفين
+    if uid != OWNER_ID:
         return await update.message.reply_text("هذا الأمر للمالك فقط.")
     if not context.args: return await update.message.reply_text("استخدم: /addadmin <user_id>")
     try:
@@ -893,7 +888,6 @@ async def adminhelp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/debugsub – تشخيص الاشتراك"
     )
 
-# ========= /formats للمدير فقط =========
 async def formats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id if update.effective_user else 0
     if not is_admin(uid):
@@ -918,6 +912,7 @@ async def make_web_app() -> web.Application:
         "conc": {"office": CONC_OFFICE, "pdf": CONC_PDF, "media": CONC_MEDIA, "image": CONC_IMAGE},
         "active": ACTIVE,
         "ptb_version": telegram.__version__,
+        "mode": "webhook" if IS_WEBHOOK else "polling",
     })
     app.router.add_get('/health', health)
     app.router.add_get('/', health)
@@ -931,12 +926,14 @@ async def on_startup_ptb(app: Application) -> None:
     BIN["gs"]       = which('gs','ghostscript')
     log.info(f"[bin] soffice={BIN['soffice']}, pdftoppm={BIN['pdftoppm']}, ffmpeg={BIN['ffmpeg']}, gs={BIN['gs']} (limit={TG_LIMIT_MB}MB)")
 
-    webapp = await make_web_app()
-    runner = web.AppRunner(webapp); await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT); await site.start()
-    app.bot_data['web_runner'] = runner
+    # في وضع Webhook لا نشغّل aiohttp على نفس المنفذ حتى لا يتعارض
+    if not IS_WEBHOOK:
+        webapp = await make_web_app()
+        runner = web.AppRunner(webapp); await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', PORT); await site.start()
+        app.bot_data['web_runner'] = runner
 
-    # polling
+    # تنظيف أي ويبهوك سابق (مفيد عند التحول بين الوضعين)
     try: await app.bot.delete_webhook(drop_pending_updates=True)
     except: pass
 
@@ -956,7 +953,7 @@ async def on_startup_ptb(app: Application) -> None:
     except Exception:
         pass
 
-    log.info(f"[http] serving on 0.0.0.0:{PORT}")
+    log.info(f"[http] serving on 0.0.0.0:{PORT} ({'webhook' if IS_WEBHOOK else 'polling'})")
 
 async def on_shutdown_ptb(app: Application) -> None:
     runner: Optional[web.AppRunner] = app.bot_data.get('web_runner')
@@ -1015,7 +1012,18 @@ def build_app() -> Application:
 
 def main() -> None:
     app = build_app()
-    app.run_polling(drop_pending_updates=True)
+    if IS_WEBHOOK and PUBLIC_URL:
+        # Webhook mode (لا Polling ولا Updater داخلي)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url=f"{PUBLIC_URL}/webhook",
+            secret_token=os.getenv("WEBHOOK_SECRET")  # اختياري
+        )
+    else:
+        # Polling (يعمل طبيعي على PTB 21+ حتى على Python 3.13)
+        app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
+
