@@ -3,6 +3,7 @@ import asyncio, logging, os, re, shutil, tempfile, uuid, time, json
 from collections import defaultdict, deque
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
+from typing import Optional
 
 from aiohttp import web
 from dotenv import load_dotenv
@@ -17,6 +18,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
+import telegram  # لعرض نسخة المكتبة في اللوج
 
 # ===================== إعدادات عامة =====================
 ENV_PATH = Path('.env')
@@ -38,14 +40,15 @@ OPS_PER_MINUTE = int(os.getenv('OPS_PER_MINUTE', '10'))
 
 # قناة الاشتراك الإجباري (username مع @ أو id -100...)
 SUB_TARGET = (os.getenv('SUB_CHANNEL', '').strip() or '')
-SUB_CHAT_ID: int | None = None
-SUB_USERNAME: str | None = None  # مثل ferpoks
+SUB_CHAT_ID: Optional[int] = None
+SUB_USERNAME: Optional[str] = None  # مثل ferpoks
 
 # اسم مستخدم المدير لزر التراسل (بدون @)
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', '').strip()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 log = logging.getLogger('convbot')
+log.info(f"PTB version at runtime: {telegram.__version__}")
 
 # ===================== حالات وتشخيص =====================
 # الطلبات تُعرّف بتوكن داخل callback لتفادي التعارض
@@ -54,8 +57,6 @@ BIN = {"soffice": None, "pdftoppm": None, "ffmpeg": None, "gs": None}
 USER_QPS: dict[int, deque] = defaultdict(deque)
 BANNED: set[int] = set()
 STATS = {"ok": 0, "fail": 0, "bytes_in": 0, "bytes_out": 0, "started_at": int(time.time())}
-
-# نشاط حي لكل نوع (لأوامر المدير)
 ACTIVE = {"office": 0, "pdf": 0, "media": 0, "image": 0}
 
 # حفظ اللغة المختارة + كل المستخدمين
@@ -86,7 +87,7 @@ def safe_name(name: str, fallback: str = "file") -> str:
     name = (name or "").strip() or fallback
     return SAFE_CHARS.sub("_", name)[:200]
 
-def ext_of(filename: str | None) -> str:
+def ext_of(filename: Optional[str]) -> str:
     return Path(filename).suffix.lower().lstrip('.') if filename else ""
 
 def size_ok(path: Path) -> bool:
@@ -105,7 +106,7 @@ async def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
     out, err = await proc.communicate()
     return proc.returncode, out.decode(errors='ignore'), err.decode(errors='ignore')
 
-def which(*names: str) -> str | None:
+def which(*names: str) -> Optional[str]:
     for n in names:
         p = shutil.which(n)
         if p: return p
@@ -171,7 +172,7 @@ def menu_keyboard(uid:int):
     )
 
 # ===================== اشتراك: حلّ القناة + تحقق =====================
-def _to_username(s: str) -> str | None:
+def _to_username(s: str) -> Optional[str]:
     s = (s or "").strip()
     if not s:
         return None
@@ -179,7 +180,7 @@ def _to_username(s: str) -> str | None:
     if s.startswith('https://t.me/'): return s.rsplit('/', 1)[-1]
     return s
 
-async def resolve_subchat_id(bot) -> int | None:
+async def resolve_subchat_id(bot) -> Optional[int]:
     """يحاول مرة واحدة جلب chat_id من username أو id، ويخزّنه."""
     global SUB_CHAT_ID, SUB_USERNAME
     if not SUB_TARGET:
@@ -364,7 +365,7 @@ async def image_to_pdf(in_path: Path, out_dir: Path, dpi: int = 150) -> Path:
         im.save(out_path, "PDF", resolution=float(dpi))
     await asyncio.to_thread(_do); return out_path
 
-async def image_to_image(in_path: Path, out_dir: Path, target_ext: str, max_side: int | None = None, quality: int = 92) -> Path:
+async def image_to_image(in_path: Path, out_dir: Path, target_ext: str, max_side: Optional[int] = None, quality: int = 92) -> Path:
     out_path = out_dir / (in_path.stem + f'.{target_ext}')
     def _do():
         im = Image.open(in_path)
@@ -448,7 +449,7 @@ async def video_to_mp4_ffmpeg(in_path: Path, out_dir: Path) -> Path:
     return out_path
 
 # ===================== تخفيض الحجم عند الحاجة =====================
-async def shrink_pdf(in_path: Path, out_dir: Path) -> Path | None:
+async def shrink_pdf(in_path: Path, out_dir: Path) -> Optional[Path]:
     if not BIN["gs"]:
         return None
     for preset in ('/ebook','/screen'):
@@ -461,7 +462,7 @@ async def shrink_pdf(in_path: Path, out_dir: Path) -> Path | None:
             return out
     return None
 
-async def shrink_video(in_path: Path, out_dir: Path) -> Path | None:
+async def shrink_video(in_path: Path, out_dir: Path) -> Optional[Path]:
     if not BIN["ffmpeg"]:
         return None
     trials = [
@@ -477,13 +478,13 @@ async def shrink_video(in_path: Path, out_dir: Path) -> Path | None:
             if size_ok(out): return out
     return src if src!=in_path and size_ok(src) else None
 
-async def shrink_image(in_path: Path, out_dir: Path, ext: str) -> Path | None:
+async def shrink_image(in_path: Path, out_dir: Path, ext: str) -> Optional[Path]:
     for max_side, q in [(2000,85),(1400,75)]:
         out = await image_to_image(in_path, out_dir, target_ext=ext, max_side=max_side, quality=q)
         if size_ok(out): return out
     return None
 
-async def shrink_audio(in_path: Path, out_dir: Path, ext: str) -> Path | None:
+async def shrink_audio(in_path: Path, out_dir: Path, ext: str) -> Optional[Path]:
     if not BIN["ffmpeg"]:
         return None
     out = out_dir / (in_path.stem + ('.mp3' if ext=='wav' else f'.{ext}'))
@@ -912,10 +913,11 @@ async def make_web_app() -> web.Application:
     app = web.Application()
     async def health(_): return web.json_response({"ok": True, "service": "converter-bot"})
     async def diag(_): return web.json_response({
-        "soice": BIN["soffice"], "pdftoppm": BIN["pdftoppm"], "ffmpeg": BIN["ffmpeg"], "gs": BIN["gs"],
+        "soffice": BIN["soffice"], "pdftoppm": BIN["pdftoppm"], "ffmpeg": BIN["ffmpeg"], "gs": BIN["gs"],
         "limit_mb": TG_LIMIT_MB, "sub_target": SUB_TARGET, "sub_chat_id": SUB_CHAT_ID,
         "conc": {"office": CONC_OFFICE, "pdf": CONC_PDF, "media": CONC_MEDIA, "image": CONC_IMAGE},
-        "active": ACTIVE
+        "active": ACTIVE,
+        "ptb_version": telegram.__version__,
     })
     app.router.add_get('/health', health)
     app.router.add_get('/', health)
@@ -957,7 +959,7 @@ async def on_startup_ptb(app: Application) -> None:
     log.info(f"[http] serving on 0.0.0.0:{PORT}")
 
 async def on_shutdown_ptb(app: Application) -> None:
-    runner: web.AppRunner | None = app.bot_data.get('web_runner')
+    runner: Optional[web.AppRunner] = app.bot_data.get('web_runner')
     if runner: await runner.cleanup()
 
 # ===================== قائمة سفلية (start/help) بالنص =====================
