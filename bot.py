@@ -34,10 +34,9 @@ TG_LIMIT_BYTES = TG_LIMIT_MB * 1024 * 1024
 OWNER_ID = int(os.getenv('OWNER_ID', '0') or 0)
 ADMINS = {OWNER_ID} if OWNER_ID else set()
 
-MAX_CONCURRENCY = int(os.getenv('MAX_CONCURRENCY', '2'))
 OPS_PER_MINUTE = int(os.getenv('OPS_PER_MINUTE', '10'))
 
-# قناة الاشتراك الإجباري (اسم مستخدم مع @ أو id رقمي -100...)
+# قناة الاشتراك الإجباري (username مع @ أو id -100...)
 SUB_TARGET = (os.getenv('SUB_CHANNEL', '').strip() or '')
 SUB_CHAT_ID: int | None = None
 SUB_USERNAME: str | None = None  # مثل ferpoks
@@ -49,9 +48,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(na
 log = logging.getLogger('convbot')
 
 # ===================== حالات وتشخيص =====================
-PENDING: dict[str, dict] = {}                   # آخر ملف بانتظار الاختيار
+# نحفظ الطلبات عبر token آمن داخل callback لتفادي تعارض التوازي
+PENDING: dict[str, dict] = {}
 BIN = {"soffice": None, "pdftoppm": None, "ffmpeg": None, "gs": None}
-sem = asyncio.Semaphore(MAX_CONCURRENCY)
 USER_QPS: dict[int, deque] = defaultdict(deque)
 BANNED: set[int] = set()
 STATS = {"ok": 0, "fail": 0, "bytes_in": 0, "bytes_out": 0, "started_at": int(time.time())}
@@ -78,7 +77,6 @@ IMG_EXTS = {"jpg", "jpeg", "png", "webp", "bmp", "tiff"}
 AUD_EXTS = {"mp3", "wav", "ogg", "m4a"}
 VID_EXTS = {"mp4", "mov", "mkv", "avi", "webm"}
 ALL_OFFICE = DOC_EXTS | PPT_EXTS | XLS_EXTS
-# ✅ إصلاح الـregex: باك سلاش واحد قبل الشرطة
 SAFE_CHARS = re.compile(r"[^A-Za-z0-9_.\- ]+")
 
 def safe_name(name: str, fallback: str = "file") -> str:
@@ -176,7 +174,6 @@ def _to_username(s: str) -> str | None:
         return None
     if s.startswith('@'): return s[1:]
     if s.startswith('https://t.me/'): return s.rsplit('/', 1)[-1]
-    # اسم نظيف بدون @
     return s
 
 async def resolve_subchat_id(bot) -> int | None:
@@ -213,7 +210,6 @@ async def ensure_joined(bot, uid:int) -> bool:
         return True
     chat_id = await resolve_subchat_id(bot)
     if chat_id is None:
-        # غالبًا البوت ليس أدمن بالقناة
         log.warning("ensure_joined: cannot resolve channel (bot probably not admin in the channel).")
         return False
     try:
@@ -231,7 +227,6 @@ async def gate_or_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ok = await ensure_joined(context.bot, uid)
     if ok:
         return True
-    # زر الاشتراك + تحقق
     uname = SUB_USERNAME or _to_username(SUB_TARGET)
     join_url = f"https://t.me/{uname}" if uname else None
     lang = user_lang(uid)
@@ -289,31 +284,51 @@ def kind_for_extension(ext: str) -> str:
     if ext == 'pdf': return 'pdf'
     return 'unknown'
 
-def options_for(kind: str, ext: str) -> list[list[InlineKeyboardButton]]:
+def options_for(kind: str, ext: str, token: str) -> list[list[InlineKeyboardButton]]:
     btns: list[list[InlineKeyboardButton]] = []
+    def cb(code: str) -> str:
+        return f'c:{token}:{code}'
     if kind == 'office':
         if BIN["soffice"]:
-            btns.append([InlineKeyboardButton('تحويل إلى PDF', callback_data='c:PDF')])
+            btns.append([InlineKeyboardButton('تحويل إلى PDF', callback_data=cb('PDF'))])
     elif kind == 'pdf':
-        btns.append([InlineKeyboardButton('PDF → DOCX', callback_data='c:DOCX')])
+        btns.append([InlineKeyboardButton('PDF → DOCX', callback_data=cb('DOCX'))])
         btns.append([
-            InlineKeyboardButton('PDF → صور PNG (ZIP)', callback_data='c:PNGZIP'),
-            InlineKeyboardButton('PDF → صور JPG (ZIP)', callback_data='c:JPGZIP'),
+            InlineKeyboardButton('PDF → صور PNG (ZIP)', callback_data=cb('PNGZIP')),
+            InlineKeyboardButton('PDF → صور JPG (ZIP)',  callback_data=cb('JPGZIP')),
         ])
     elif kind == 'image':
-        row1 = [InlineKeyboardButton('إلى PDF', callback_data='c:PDF')]
+        row1 = [InlineKeyboardButton('إلى PDF', callback_data=cb('PDF'))]
         targets = ['JPG','PNG','WEBP']
-        row2 = [InlineKeyboardButton(f'إلى {t}', callback_data=f'c:{t}') for t in targets if t.lower()!=ext]
-        btns.append(row1); 
+        row2 = [InlineKeyboardButton(f'إلى {t}', callback_data=cb(t)) for t in targets if t.lower()!=ext]
+        btns.append(row1)
         if row2: btns.append(row2)
     elif kind == 'audio':
         if BIN["ffmpeg"]:
-            row = [InlineKeyboardButton(f'إلى {t}', callback_data=f'c:{t}') for t in ['MP3','WAV','OGG'] if t.lower()!=ext]
+            row = [InlineKeyboardButton(f'إلى {t}', callback_data=cb(t)) for t in ['MP3','WAV','OGG'] if t.lower()!=ext]
             if row: btns.append(row)
     elif kind == 'video':
         if BIN["ffmpeg"]:
-            btns.append([InlineKeyboardButton('إلى MP4', callback_data='c:MP4')])
+            btns.append([InlineKeyboardButton('إلى MP4', callback_data=cb('MP4'))])
     return btns
+
+# ===================== “توازي آمن” حسب النوع =====================
+CONC_OFFICE = int(os.getenv('CONC_OFFICE', '4'))   # ثقيل
+CONC_PDF    = int(os.getenv('CONC_PDF',    '6'))   # متوسط
+CONC_MEDIA  = int(os.getenv('CONC_MEDIA',  '4'))   # ثقيل (صوت/فيديو)
+CONC_IMAGE  = int(os.getenv('CONC_IMAGE',  '6'))   # خفيف
+
+sem_office = asyncio.Semaphore(CONC_OFFICE)
+sem_pdf    = asyncio.Semaphore(CONC_PDF)
+sem_media  = asyncio.Semaphore(CONC_MEDIA)
+sem_image  = asyncio.Semaphore(CONC_IMAGE)
+
+def select_sem(kind: str, choice: str):
+    if kind == 'office': return sem_office
+    if kind == 'pdf':    return sem_pdf
+    if kind in ('audio','video'): return sem_media
+    if kind == 'image':  return sem_image
+    return sem_pdf
 
 # ===================== وظائف التحويل =====================
 async def office_to_pdf(in_path: Path, out_dir: Path) -> Path:
@@ -406,7 +421,7 @@ async def audio_convert_ffmpeg(in_path: Path, out_dir: Path, target_ext: str) ->
     target_ext = target_ext.lower()
     out_path = out_dir / (in_path.stem + f'.{target_ext}')
     if target_ext=='mp3':
-        args = ['-vn','-c:a','libmp3lame','-q:a','2']  # جودة عالية
+        args = ['-vn','-c:a','libmp3lame','-q:a','2']
     elif target_ext=='wav':
         args = ['-vn','-c:a','pcm_s16le']
     elif target_ext=='ogg':
@@ -422,7 +437,7 @@ async def video_to_mp4_ffmpeg(in_path: Path, out_dir: Path) -> Path:
         raise RuntimeError('FFmpeg غير متوفر.')
     out_path = out_dir / (in_path.stem + '.mp4')
     cmd = [BIN["ffmpeg"], '-y','-i',str(in_path),
-           '-c:v','libx264','-preset','veryfast','-crf','23',   # جودة ممتازة وحجم مناسب
+           '-c:v','libx264','-preset','veryfast','-crf','23',
            '-c:a','aac','-b:a','128k', str(out_path)]
     code, out, err = await run_cmd(cmd)
     if code != 0: raise RuntimeError(f"FFmpeg فشل: {err or out}")
@@ -574,15 +589,16 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await msg.reply_text(t(uid,"unknown")); return
 
     token = uuid.uuid4().hex[:10]
-    PENDING[token] = {'file_id': file_id, 'file_name': file_name, 'ext': ext, 'kind': kind}
+    PENDING[token] = {'file_id': file_id, 'file_name': file_name, 'ext': ext, 'kind': kind, 'uid': uid, 'ts': time.time()}
 
-    kb = options_for(kind, ext)
+    kb = options_for(kind, ext, token)
     if not kb:
         await msg.reply_text('لا تحويلات متاحة لهذه الصيغة/البيئة حالياً.'); return
 
+    cancel_btn = [[InlineKeyboardButton('إلغاء', callback_data=f'c:{token}:CANCEL')]]
     await msg.reply_text(
         t(uid,"pick_conv").format(safe_name(file_name)),
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('إلغاء', callback_data='c:CANCEL')]]+kb),
+        reply_markup=InlineKeyboardMarkup(cancel_btn + kb),
         parse_mode='Markdown'
     )
 
@@ -594,24 +610,37 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if data.startswith('chk:'):
         return await on_check_join(update, context)
     if not data.startswith('c:'): return
-    choice = data.split(':',1)[1]
+
+    # c:{token}:{choice}
+    try:
+        _, token, choice = data.split(':', 2)
+    except ValueError:
+        return
+
     uid = query.from_user.id
+    meta = PENDING.get(token)
+    if not meta:
+        try: await query.edit_message_text('⏳ انتهت صلاحية الطلب.')
+        except: pass
+        return
+    if meta.get('uid') != uid:
+        await query.answer("هذا الطلب ليس لك.", show_alert=True)
+        return
+
     if choice == 'CANCEL':
+        PENDING.pop(token, None)
         try: await query.edit_message_text(t(uid,"canceled"))
         except: pass
         return
     if not await ensure_joined(context.bot, uid):
         return await gate_or_prompt(update, context)
 
-    if not PENDING:
-        await query.edit_message_text('⏳ انتهت صلاحية الطلب.'); return
-
-    token, meta = next(reversed(list(PENDING.items())))
     file_id, file_name, ext, kind = meta['file_id'], meta['file_name'], meta['ext'], meta['kind']
 
     await query.edit_message_text('⏳ جارٍ التحويل...')
     workdir = Path(tempfile.mkdtemp(prefix='convbot_'))
     try:
+        sem = select_sem(kind, choice)
         async with sem:
             try: await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
             except: pass
@@ -693,9 +722,10 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🛠️ لوحة المدير\n"
         f"- أدوات: soffice={bool(BIN['soffice'])}, pdftoppm={bool(BIN['pdftoppm'])}, ffmpeg={bool(BIN['ffmpeg'])}, gs={bool(BIN['gs'])}\n"
-        f"- الحد: {TG_LIMIT_MB}MB | التوازي: {MAX_CONCURRENCY} | OPS/min: {OPS_PER_MINUTE}\n"
+        f"- الحد: {TG_LIMIT_MB}MB | OPS/min: {OPS_PER_MINUTE}\n"
         f"- تشغيل منذ: {up//3600}h {(up%3600)//60}m\n"
-        f"- محظورون: {len(BANNED)}"
+        f"- محظورون: {len(BANNED)}\n"
+        f"- توازي: office={CONC_OFFICE}, pdf={CONC_PDF}, media={CONC_MEDIA}, image={CONC_IMAGE}"
     )
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -757,7 +787,11 @@ async def formats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def make_web_app() -> web.Application:
     app = web.Application()
     async def health(_): return web.json_response({"ok": True, "service": "converter-bot"})
-    async def diag(_): return web.json_response({"soffice": BIN["soffice"], "pdftoppm": BIN["pdftoppm"], "ffmpeg": BIN["ffmpeg"], "gs": BIN["gs"], "limit_mb": TG_LIMIT_MB, "sub_target": SUB_TARGET, "sub_chat_id": SUB_CHAT_ID})
+    async def diag(_): return web.json_response({
+        "soffice": BIN["soffice"], "pdftoppm": BIN["pdftoppm"], "ffmpeg": BIN["ffmpeg"], "gs": BIN["gs"],
+        "limit_mb": TG_LIMIT_MB, "sub_target": SUB_TARGET, "sub_chat_id": SUB_CHAT_ID,
+        "conc": {"office": CONC_OFFICE, "pdf": CONC_PDF, "media": CONC_MEDIA, "image": CONC_IMAGE}
+    })
     app.router.add_get('/health', health)
     app.router.add_get('/', health)
     app.router.add_get('/diag', diag)
@@ -779,7 +813,6 @@ async def on_startup_ptb(app: Application) -> None:
     try: await app.bot.delete_webhook(drop_pending_updates=True)
     except: pass
 
-    # لا نعرض /formats ضمن الأوامر العامة
     try:
         await app.bot.set_my_commands([
             BotCommand("start","Start / ابدأ"),
