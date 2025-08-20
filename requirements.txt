@@ -5,3 +5,8 @@ Pillow==10.4.0
 img2pdf==0.5.1
 pdf2image==1.17.0
 pdf2docx==0.5.8
+CONC_OFFICE=4
+CONC_PDF=6
+CONC_MEDIA=4
+CONC_IMAGE=6
+OPS_PER_MINUTE=10
