@@ -45,7 +45,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(na
 log = logging.getLogger('convbot')
 
 # ===================== حالات وتشخيص =====================
-PENDING: dict[str, dict] = {}                   # آخر ملف بانتظار الاختيار
+PENDING: dict[str, dict] = {}
 BIN = {"soffice": None, "pdftoppm": None, "ffmpeg": None, "gs": None}
 sem = asyncio.Semaphore(MAX_CONCURRENCY)
 USER_QPS: dict[int, deque] = defaultdict(deque)
@@ -74,7 +74,6 @@ IMG_EXTS = {"jpg", "jpeg", "png", "webp", "bmp", "tiff"}
 AUD_EXTS = {"mp3", "wav", "ogg", "m4a"}
 VID_EXTS = {"mp4", "mov", "mkv", "avi", "webm"}
 ALL_OFFICE = DOC_EXTS | PPT_EXTS | XLS_EXTS
-# ✅ إصلاح الـ regex: باك سلاش واحد فقط قبل الشرطة أو ضع الشرطة آخر المجموعة
 SAFE_CHARS = re.compile(r"[^A-Za-z0-9_.\- ]+")
 
 def safe_name(name: str, fallback: str = "file") -> str:
@@ -125,6 +124,7 @@ LANGS = {
         "contact": "📬 تواصل مع الإدارة",
         "menu_start": "▶️ ابدأ",
         "menu_help": "ℹ️ مساعدة",
+        "admin_only": "🚫 هذا الأمر للمدير فقط.",
     },
     "en": {
         "choose_lang": "Choose your language:",
@@ -143,6 +143,7 @@ LANGS = {
         "contact": "📬 Contact admin",
         "menu_start": "▶️ Start",
         "menu_help": "ℹ️ Help",
+        "admin_only": "🚫 Admin only.",
     }
 }
 
@@ -192,13 +193,12 @@ async def ensure_joined(bot, uid:int) -> bool:
 
 async def gate_or_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """يرجع True إذا مسموح، وإلا يرسل رسالة الاشتراك ويرجع False"""
-    if not SUB_CHANNEL:  # لا يوجد شرط اشتراك
+    if not SUB_CHANNEL:
         return True
     uid = update.effective_user.id if update.effective_user else 0
     ok = await ensure_joined(context.bot, uid)
     if ok:
         return True
-    # أرسل زر اشتراك + تحقق
     lang = user_lang(uid)
     join_url = f"https://t.me/{SUB_CHANNEL.lstrip('@')}" if SUB_CHANNEL.startswith("@") else None
     buttons = [
@@ -336,7 +336,7 @@ async def audio_convert_ffmpeg(in_path: Path, out_dir: Path, target_ext: str) ->
     target_ext = target_ext.lower()
     out_path = out_dir / (in_path.stem + f'.{target_ext}')
     if target_ext=='mp3':
-        args = ['-vn','-c:a','libmp3lame','-q:a','2']  # جودة عالية
+        args = ['-vn','-c:a','libmp3lame','-q:a','2']
     elif target_ext=='wav':
         args = ['-vn','-c:a','pcm_s16le']
     elif target_ext=='ogg':
@@ -352,7 +352,7 @@ async def video_to_mp4_ffmpeg(in_path: Path, out_dir: Path) -> Path:
         raise RuntimeError('FFmpeg غير متوفر.')
     out_path = out_dir / (in_path.stem + '.mp4')
     cmd = [BIN["ffmpeg"], '-y','-i',str(in_path),
-           '-c:v','libx264','-preset','veryfast','-crf','23',   # جودة ممتازة وحجم مناسب
+           '-c:v','libx264','-preset','veryfast','-crf','23',
            '-c:a','aac','-b:a','128k', str(out_path)]
     code, out, err = await run_cmd(cmd)
     if code != 0: raise RuntimeError(f"FFmpeg فشل: {err or out}")
@@ -420,7 +420,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id if update.effective_user else 0
     if str(uid) not in USERS:
         await choose_lang(update, context); return
-    # تحقق اشتراك
     if not await gate_or_prompt(update, context):
         return
     await update.message.reply_text(
@@ -448,7 +447,6 @@ async def on_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if code not in ("ar","en"): return
     uid = q.from_user.id
     set_user_lang(uid, code)
-    # بعد اختيار اللغة: اطلب الاشتراك أو ابدأ مباشرة
     if SUB_CHANNEL:
         ok = await ensure_joined(context.bot, uid)
         if not ok:
@@ -616,10 +614,13 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         PENDING.pop(token, None)
 
 # ===================== Handlers (مدير) =====================
+def is_admin(uid: int) -> bool:
+    return uid in ADMINS
+
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else 0
     if not is_admin(uid):
-        return await update.message.reply_text("🚫 هذا الأمر للمدير فقط.")
+        return await update.message.reply_text(t(uid,"admin_only"))
     up = int(time.time()) - STATS["started_at"]
     await update.message.reply_text(
         "🛠️ لوحة المدير\n"
@@ -630,6 +631,9 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid):
+        return await update.message.reply_text(t(uid,"admin_only"))
     ok, fail = STATS["ok"], STATS["fail"]
     await update.message.reply_text(
         "📈 الإحصاءات\n"
@@ -639,7 +643,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setlimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else 0
-    if not is_admin(uid): return await update.message.reply_text("🚫 هذا الأمر للمدير فقط.")
+    if not is_admin(uid): return await update.message.reply_text(t(uid,"admin_only"))
     if not context.args: return await update.message.reply_text("استخدم: /setlimit 49")
     try:
         mb = int(context.args[0]); 
@@ -652,7 +656,7 @@ async def setlimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else 0
-    if not is_admin(uid): return await update.message.reply_text("🚫 للمَدير فقط.")
+    if not is_admin(uid): return await update.message.reply_text(t(uid,"admin_only"))
     if not context.args: return await update.message.reply_text("استخدم: /ban <user_id>")
     try:
         BANNED.add(int(context.args[0])); await update.message.reply_text("تم الحظر ✅")
@@ -660,11 +664,27 @@ async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else 0
-    if not is_admin(uid): return await update.message.reply_text("🚫 للمَدير فقط.")
+    if not is_admin(uid): return await update.message.reply_text(t(uid,"admin_only"))
     if not context.args: return await update.message.reply_text("استخدم: /unban <user_id>")
     try:
         BANNED.discard(int(context.args[0])); await update.message.reply_text("تم إلغاء الحظر ✅")
     except: await update.message.reply_text("user_id غير صالح.")
+
+# ========= /formats للمدير فقط =========
+async def formats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid):
+        return await update.message.reply_text(t(uid,"admin_only"))
+    # يعرض تلخيص الصيغ المتاحة (للمدير فقط)
+    await update.message.reply_text(
+        "🧾 الصيغ المدعومة (Admin):\n"
+        "• Office → PDF (DOC/DOCX/RTF/ODT/PPT/PPTX/XLS/XLSX)\n"
+        "• PDF → DOCX | صور (PNG/JPG داخل ZIP)\n"
+        "• صور: JPG/PNG/WEBP ↔ | صورة → PDF\n"
+        "• صوت: MP3/WAV/OGG — فيديو: إلى MP4\n"
+        f"• حد تيليجرام الحالي: {TG_LIMIT_MB}MB",
+        disable_web_page_preview=True
+    )
 
 # ===================== خادم صحة + تشخيص =====================
 async def make_web_app() -> web.Application:
@@ -691,22 +711,19 @@ async def on_startup_ptb(app: Application) -> None:
     try: await app.bot.delete_webhook(drop_pending_updates=True)
     except: pass
 
-    # قائمة الأوامر للزر السفلي في تيليجرام (لكلا اللغتين)
+    # لا نعرض /formats ضمن الأوامر العامة حتى لا يظهر للمستخدمين
     try:
         await app.bot.set_my_commands([
             BotCommand("start","Start / ابدأ"),
             BotCommand("help","Help / مساعدة"),
-            BotCommand("formats","Formats / الصيغ")
         ])
         await app.bot.set_my_commands([
             BotCommand("start","ابدأ"),
             BotCommand("help","مساعدة"),
-            BotCommand("formats","الصيغ")
         ], language_code="ar")
         await app.bot.set_my_commands([
             BotCommand("start","Start"),
             BotCommand("help","Help"),
-            BotCommand("formats","Formats")
         ], language_code="en")
     except Exception:
         pass
@@ -717,13 +734,8 @@ async def on_shutdown_ptb(app: Application) -> None:
     runner: web.AppRunner | None = app.bot_data.get('web_runner')
     if runner: await runner.cleanup()
 
-# ===================== أوامر إضافية =====================
-async def formats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id if update.effective_user else 0
-    await update.message.reply_text(LANGS[user_lang(uid)]["help"], reply_markup=menu_keyboard(uid), disable_web_page_preview=True)
-
+# ===================== قائمة سفلية (start/help) بالنص =====================
 async def text_shortcuts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يحاكي ضغط أزرار القائمة السفلية"""
     uid = update.effective_user.id if update.effective_user else 0
     txt = (update.message.text or "").strip()
     if txt in (LANGS['ar']["menu_help"], LANGS['en']["menu_help"]):
@@ -742,7 +754,6 @@ def build_app() -> Application:
     # المستخدم
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help_cmd))
-    application.add_handler(CommandHandler('formats', formats_cmd))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_shortcuts))
     # اللغة والاشتراك
     application.add_handler(CallbackQueryHandler(on_lang, pattern=r'^lang:'))
@@ -751,6 +762,7 @@ def build_app() -> Application:
     application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VIDEO, handle_file))
     application.add_handler(CallbackQueryHandler(on_choice, pattern=r'^c:'))
     # المدير
+    application.add_handler(CommandHandler('formats', formats_cmd))
     application.add_handler(CommandHandler('admin', admin_cmd))
     application.add_handler(CommandHandler('stats', stats_cmd))
     application.add_handler(CommandHandler('setlimit', setlimit_cmd))
@@ -768,3 +780,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
