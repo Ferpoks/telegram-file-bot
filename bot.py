@@ -44,68 +44,66 @@ logging.basicConfig(
 )
 log = logging.getLogger("convbot")
 
-# بيئة التشغيل
+# متغيرات البيئة
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "").lstrip("@")
-SUB_CHANNEL = os.getenv("SUB_CHANNEL", "").strip()  # @username أو link أو username فقط
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
+SUB_CHANNEL = os.getenv("SUB_CHANNEL", "").strip()          # @user أو user أو رابط t.me
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")         # مثال: https://telegram-file-bot-xxx.onrender.com
 PORT = int(os.getenv("PORT", "10000"))
 
-# حدود تيليجرام والملف
+# حدود حجم تيليجرام والملف
 TG_LIMIT_MB = int(os.getenv("TG_LIMIT_MB", "49"))
 TG_LIMIT = TG_LIMIT_MB * 1024 * 1024
 
-# التوازي (افتراضي 20 كما طلبت)
+# التوازي (طلبت 20)
 CONC_IMAGE = int(os.getenv("CONC_IMAGE", "20"))
-CONC_PDF = int(os.getenv("CONC_PDF", "20"))
+CONC_PDF   = int(os.getenv("CONC_PDF", "20"))
 CONC_MEDIA = int(os.getenv("CONC_MEDIA", "20"))
-CONC_OFFICE = int(os.getenv("CONC_OFFICE", "20"))
+CONC_OFFICE= int(os.getenv("CONC_OFFICE", "20"))
 
-# API خارجي اختياري لتحويل Office->PDF (عند غياب LibreOffice)
+# API اختياري لـ Office→PDF عند عدم وجود LibreOffice
 PDFCO_API_KEY = os.getenv("PDFCO_API_KEY", "").strip()
 
-# تشغيل ويبهوك أم Polling؟ (إذا توفر PUBLIC_URL نشغّل ويبهوك)
+# تشغيل Webhook إذا كان PUBLIC_URL موجود
 IS_WEBHOOK = bool(PUBLIC_URL)
 
-# صحّة المسارات
+# مسارات عمل
 WORK_ROOT = Path("/tmp/convbot")
 WORK_ROOT.mkdir(parents=True, exist_ok=True)
 
-# الكشف عن البرامج الطرفية
+# كشف برامج النظام (قد تكون None)
 BIN = {
-    "soffice": shutil.which("soffice"),     # LibreOffice (قد يكون None على Render)
+    "soffice": shutil.which("soffice"),     # LibreOffice
     "pdftoppm": shutil.which("pdftoppm"),   # Poppler
     "ffmpeg": shutil.which("ffmpeg"),
     "gs": shutil.which("gs"),               # GhostScript
 }
-
 log.info("[bin] soffice=%s, pdftoppm=%s, ffmpeg=%s, gs=%s (limit=%dMB)",
          BIN["soffice"], BIN["pdftoppm"], BIN["ffmpeg"], BIN["gs"], TG_LIMIT_MB)
 
 SAFE_CHARS = re.compile(r"[^A-Za-z0-9_.\- ]+")
 
-# الحالة البسيطة (لغة المستخدم)
+# لغة المستخدم البسيطة بالذاكرة
 USER_LANG: Dict[int, str] = {}
 
 # Semaphores للتوازي
 SEM_IMAGE = asyncio.Semaphore(CONC_IMAGE)
-SEM_PDF = asyncio.Semaphore(CONC_PDF)
+SEM_PDF   = asyncio.Semaphore(CONC_PDF)
 SEM_MEDIA = asyncio.Semaphore(CONC_MEDIA)
-SEM_OFFICE = asyncio.Semaphore(CONC_OFFICE)
+SEM_OFFICE= asyncio.Semaphore(CONC_OFFICE)
 
-# سيتم حلّ chat_id للقناة عند الإقلاع
+# معلومات قناة الاشتراك بعد الحلّ
 CHANNEL_CHAT_ID: Optional[int] = None
 CHANNEL_USERNAME_LINK: Optional[str] = None  # t.me/<user>
 
 # ====== ترجمات بسيطة ======
-
 T = {
     "ar": {
         "start_title": "👋 أهلاً بك!",
-        "start_desc": "أنا بوت تحويل ملفات. اختر لغتك ثم أرسل أي ملف وسأعرض لك صيغ التحويل المتاحة.\n\n"
-                      "المدعوم: صور PNG/JPG/WEBP ⇄ PDF، PDF ⇢ صور/ DOCX، صوت ⇄ MP3/WAV/OGG، فيديو ⇢ MP4.\n"
-                      "تحويل ملفات أوفيس → PDF متاح إذا توفّر LibreOffice على الخادم أو مفتاح PDF.co.",
+        "start_desc": ("أنا بوت تحويل ملفات. اختر لغتك ثم أرسل أي ملف وسأعرض لك صيغ التحويل المتاحة.\n\n"
+                       "المدعوم: صور PNG/JPG/WEBP ⇄ PDF، PDF ⇢ صور/ DOCX، صوت ⇄ MP3/WAV/OGG، فيديو ⇢ MP4.\n"
+                       "تحويل أوفيس → PDF متاح إذا كان LibreOffice موجوداً أو لديك مفتاح PDF.co."),
         "choose_lang": "اختر اللغة:",
         "btn_ar": "العربية 🇸🇦",
         "btn_en": "English 🇬🇧",
@@ -120,15 +118,15 @@ T = {
         "sent": "✅ تم الإرسال.",
         "admin_only": "هذا الأمر للمدير فقط.",
         "formats_title": "صيَغ التحويل المتاحة حالياً:",
-        "stats": "📊 إحصائيات سريعة:\nمستخدمون فريدون اليوم تقريباً: {u}\nمحاولات تحويل: {c}",
+        "stats": "📊 إحصائيات سريعة:\nمستخدمون فريدون تقريباً: {u}\nمحاولات تحويل: {c}",
         "lang_saved": "✅ تم ضبط اللغة على العربية.",
         "lang_prompt": "↪️ اختر لغتك من الأزرار.",
     },
     "en": {
         "start_title": "👋 Welcome!",
-        "start_desc": "I'm a file converter bot. Pick your language, then send a file and I'll show you the available conversions.\n\n"
-                      "Supported: Images PNG/JPG/WEBP ⇄ PDF, PDF ⇢ images/DOCX, audio ⇄ MP3/WAV/OGG, video ⇢ MP4.\n"
-                      "Office → PDF is available if LibreOffice exists on server or a PDF.co API key is set.",
+        "start_desc": ("I'm a file converter bot. Pick your language, then send a file and I'll show you the available conversions.\n\n"
+                       "Supported: Images PNG/JPG/WEBP ⇄ PDF, PDF ⇢ images/DOCX, audio ⇄ MP3/WAV/OGG, video ⇢ MP4.\n"
+                       "Office → PDF is available if LibreOffice exists or you set a PDF.co API key."),
         "choose_lang": "Choose a language:",
         "btn_ar": "العربية 🇸🇦",
         "btn_en": "English 🇬🇧",
@@ -143,7 +141,7 @@ T = {
         "sent": "✅ Sent.",
         "admin_only": "This command is admin-only.",
         "formats_title": "Currently supported conversions:",
-        "stats": "📊 Quick stats:\nApprox unique users today: {u}\nConversions: {c}",
+        "stats": "📊 Quick stats:\nApprox unique users: {u}\nConversions: {c}",
         "lang_saved": "✅ Language set to English.",
         "lang_prompt": "↪️ Pick your language via buttons.",
     },
@@ -172,40 +170,31 @@ async def ensure_joined(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     """يتأكد أن المستخدم مشترك بالقناة قبل السماح بالاستعمال."""
     global CHANNEL_CHAT_ID, CHANNEL_USERNAME_LINK
     if not CHANNEL_CHAT_ID:
-        # لا يوجد اشتراط
+        # لم يتم تفعيل الاشتراط
         return True
-
     user = update.effective_user
     if not user:
         return True
-
     try:
         member = await ctx.bot.get_chat_member(CHANNEL_CHAT_ID, user.id)
-        status = member.status
-        if status in ("member", "administrator", "creator"):
+        if member.status in ("member", "administrator", "creator"):
             return True
     except Exception as e:
         log.warning("ensure_joined error: %s", e)
 
-    # ليس مشترك
     btn = InlineKeyboardMarkup.from_button(
         InlineKeyboardButton(tr(update, "join_btn"), url=f"https://t.me/{CHANNEL_USERNAME_LINK}")
     )
-    await update.effective_message.reply_text(
-        tr(update, "must_join"),
-        reply_markup=btn
-    )
+    await update.effective_message.reply_text(tr(update, "must_join"), reply_markup=btn)
     return False
+
+# ====== إنشاء التطبيق ومعالجاته ======
 
 def build_app() -> Application:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is missing")
 
-    application: Application = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .build()
-    )
+    application: Application = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # أوامر
     application.add_handler(CommandHandler("start", cmd_start))
@@ -215,28 +204,13 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("stats", cmd_stats))
     application.add_handler(CommandHandler("debugsub", cmd_debugsub))
 
-    # زر اختيار اللغة
+    # أزرار اختيار اللغة والتحويل
     application.add_handler(CallbackQueryHandler(cb_lang, pattern=r"^lang:(ar|en)$"))
-
-    # أزرار التحويل
     application.add_handler(CallbackQueryHandler(cb_convert, pattern=r"^conv:.+"))
 
-    # استقبال ملفات
-    application.add_handler(MessageHandler(
-        filters.Document | filters.PHOTO | filters.VIDEO | filters.AUDIO,
-        on_file
-    ))
-
-    # ضبط الأوامر في واجهة Telegram
-    async def set_cmds(app: Application):
-        await app.bot.set_my_commands([
-            BotCommand("start", "Start / اختر اللغة"),
-            BotCommand("help", "Help / المساعدة"),
-            BotCommand("lang", "Language / تغيير اللغة"),
-        ])
-        # قنوات / أقران
-        # لا شيء إضافي
-    application.post_init = set_cmds
+    # استقبال الملفات — التصحيح هنا: استخدم filters.Document.ALL
+    file_filter = (filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO)
+    application.add_handler(MessageHandler(file_filter, on_file))
 
     return application
 
@@ -267,9 +241,7 @@ async def cb_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     choice = q.data.split(":")[1]
     USER_LANG[q.from_user.id] = choice
-    txt = T[choice]["lang_saved"]
-    await q.edit_message_text(txt, reply_markup=None)
-    # أرسل وصف الخدمة بعد الحفظ
+    await q.edit_message_text(T[choice]["lang_saved"], reply_markup=None)
     await q.message.reply_text(
         f"<b>{T[choice]['start_title']}</b>\n\n{T[choice]['start_desc']}",
         parse_mode=ParseMode.HTML,
@@ -284,10 +256,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(txt, reply_markup=reply_kb())
 
 async def cmd_formats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user and update.effective_user.id != OWNER_ID:
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
         await update.effective_message.reply_text(tr(update, "admin_only"))
         return
-
     lines = []
     lines.append("• Images: PNG ⇄ JPG ⇄ WEBP, Image → PDF")
     lines.append("• PDF → Images (PNG/JPG) [ZIP], PDF → DOCX")
@@ -297,24 +268,20 @@ async def cmd_formats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append("• Office → PDF (غير متاح حالياً: يحتاج LibreOffice أو PDF.co)")
     if BIN["ffmpeg"]:
         lines.append("• Audio ⇄ MP3/WAV/OGG, Video → MP4")
-    await update.effective_message.reply_text(
-        f"{tr(update, 'formats_title')}\n\n" + "\n".join(lines)
-    )
+    await update.effective_message.reply_text(f"{tr(update, 'formats_title')}\n\n" + "\n".join(lines))
 
-# عدّاد بسيط (في الذاكرة فقط)
+# إحصائيات بسيطة بالذاكرة
 STATS_U = set()
 STATS_C = 0
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user and update.effective_user.id != OWNER_ID:
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
         await update.effective_message.reply_text(tr(update, "admin_only"))
         return
-    await update.effective_message.reply_text(
-        tr(update, "stats", u=len(STATS_U), c=STATS_C)
-    )
+    await update.effective_message.reply_text(tr(update, "stats", u=len(STATS_U), c=STATS_C))
 
 async def cmd_debugsub(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user and update.effective_user.id != OWNER_ID:
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
         await update.effective_message.reply_text(tr(update, "admin_only"))
         return
     await update.effective_message.reply_text(
@@ -335,7 +302,6 @@ def detect_kind(filename: str, mime: Optional[str]) -> str:
         return "video"
     if ext in ("doc", "docx", "rtf", "odt", "ppt", "pptx", "xls", "xlsx"):
         return "office"
-    # fallback
     if mime:
         if mime.startswith("image/"): return "image"
         if mime.startswith("audio/"): return "audio"
@@ -346,16 +312,9 @@ def detect_kind(filename: str, mime: Optional[str]) -> str:
 def conv_options(kind: str) -> list:
     opts = []
     if kind == "image":
-        opts = [
-            ("IMG→PDF", "img2pdf"),
-            ("PNG", "to_png"), ("JPG", "to_jpg"), ("WEBP", "to_webp"),
-        ]
+        opts = [("IMG→PDF", "img2pdf"), ("PNG", "to_png"), ("JPG", "to_jpg"), ("WEBP", "to_webp")]
     elif kind == "pdf":
-        opts = [
-            ("PDF→JPG (ZIP)", "pdf2jpg"),
-            ("PDF→PNG (ZIP)", "pdf2png"),
-            ("PDF→DOCX", "pdf2docx"),
-        ]
+        opts = [("PDF→JPG (ZIP)", "pdf2jpg"), ("PDF→PNG (ZIP)", "pdf2png"), ("PDF→DOCX", "pdf2docx")]
     elif kind == "audio":
         opts = [("MP3", "to_mp3"), ("WAV", "to_wav"), ("OGG", "to_ogg")]
     elif kind == "video":
@@ -372,19 +331,17 @@ class Job:
     file_path: Path
     file_name: str
 
-JOBS: Dict[str, Job] = {}  # key by callback token
+JOBS: Dict[str, Job] = {}
 
 async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await ensure_joined(update, ctx):
         return
-
-    global STATS_U
     if update.effective_user:
         STATS_U.add(update.effective_user.id)
 
     msg = update.effective_message
 
-    # احصل على الملف
+    # احصل على الملف من أي نوع
     if msg.document:
         tgfile = msg.document
         size = tgfile.file_size or 0
@@ -422,39 +379,29 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("لا توجد تحويلات مناسبة لهذا النوع حالياً.")
         return
 
-    # نزّل الملف لمجلد مؤقت
+    # تنزيل إلى مجلد مؤقت
     tmpd = Path(tempfile.mkdtemp(prefix=f"u{update.effective_user.id}_", dir=WORK_ROOT))
     in_path = tmpd / clean_name(fname)
-
-    # تنزيل
     fobj = await ctx.bot.get_file(file_id)
     await fobj.download_to_drive(in_path.as_posix())
 
-    # خزّن المهمة
     token = os.urandom(6).hex()
     JOBS[token] = Job(update.effective_user.id, kind, in_path, in_path.name)
 
-    # أعرض خيارات التحويل
-    kb = []
-    row = []
+    kb, row = [], []
     for text, code in options:
         row.append(InlineKeyboardButton(text, callback_data=f"conv:{token}:{code}"))
         if len(row) == 3:
             kb.append(row); row = []
-    if row:
-        kb.append(row)
+    if row: kb.append(row)
 
-    await msg.reply_text(tr(update, "choose_action"),
-                         reply_markup=InlineKeyboardMarkup(kb))
+    await msg.reply_text(tr(update, "choose_action"), reply_markup=InlineKeyboardMarkup(kb))
 
 # ====== تنفيذ التحويلات ======
 
 async def run_cmd(cmd: list, cwd=None, timeout=600) -> Tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=cwd,
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=cwd
     )
     out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     return proc.returncode, out_b.decode("utf-8", "ignore"), err_b.decode("utf-8", "ignore")
@@ -472,58 +419,47 @@ async def image_convert(in_path: Path, out_path: Path):
         im.save(out_path)
 
 async def pdf_to_images_zip(in_path: Path, fmt: str, out_zip: Path):
-    # استخدم pdf2image (يعتمد على pdftoppm)
     images = convert_from_path(in_path.as_posix(), fmt=fmt)
-    tmpd = out_zip.parent / (out_zip.stem + "_pages")
-    tmpd.mkdir(parents=True, exist_ok=True)
+    d = out_zip.parent / (out_zip.stem + "_pages")
+    d.mkdir(parents=True, exist_ok=True)
     files = []
     for i, im in enumerate(images, 1):
-        p = tmpd / f"page_{i:03d}.{fmt}"
+        p = d / f"page_{i:03d}.{fmt}"
         im.save(p)
         files.append(p)
-    # zip
     import zipfile
     with zipfile.ZipFile(out_zip, "w") as z:
         for p in files:
             z.write(p, arcname=p.name)
 
 async def pdf_to_docx(in_path: Path, out_path: Path):
-    # pdf2docx
     pdf2docx_parse(in_path.as_posix(), out_path.as_posix())
 
 async def office_to_pdf(in_path: Path, out_path: Path):
     if BIN["soffice"]:
-        # soffice --headless --convert-to pdf --outdir <dir> <file>
         cmd = [BIN["soffice"], "--headless", "--convert-to", "pdf",
                "--outdir", out_path.parent.as_posix(), in_path.as_posix()]
         code, out, err = await run_cmd(cmd)
         if code != 0:
             raise RuntimeError(f"LibreOffice failed: {err or out}")
-        if not out_path.exists():
-            # اسم الناتج قد يطابق اسم الملف بامتداد pdf
-            cand = out_path.parent / (in_path.stem + ".pdf")
-            if cand.exists():
-                cand.rename(out_path)
+        cand = out_path.parent / (in_path.stem + ".pdf")
+        if cand.exists():
+            cand.rename(out_path)
         if not out_path.exists():
             raise RuntimeError("output not found")
         return
 
-    # بديل API (اختياري)
     if PDFCO_API_KEY:
-        # استدعاء PDF.co (نرفع الملف ثم نستلم PDF)
-        # endpoint مبسط عام: /v1/pdf/convert/from/<ext>
         ext = in_path.suffix.lower().lstrip(".")
         url = f"https://api.pdf.co/v1/pdf/convert/from/{ext}"
         headers = {"x-api-key": PDFCO_API_KEY}
         files = {"file": (in_path.name, in_path.read_bytes())}
-        data = {}
         async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(url, headers=headers, files=files, data=data)
+            r = await client.post(url, headers=headers, files=files)
             r.raise_for_status()
             jr = r.json()
             if not jr.get("success"):
                 raise RuntimeError(jr.get("message", "pdfco failed"))
-            # قد يعيد link أو بايتات؛ نجرّب common field "url"
             link = jr.get("url")
             if not link:
                 raise RuntimeError("pdfco: no url in response")
@@ -549,18 +485,14 @@ async def cb_convert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not job:
         await q.edit_message_text("انتهت صلاحية هذه العملية، أعد إرسال الملف.")
         return
-
-    # تحقق من الملكية
     if job.user_id != q.from_user.id:
         await q.edit_message_text("هذه العملية ليست لك.")
         return
 
-    # أبلغ المستخدم
     await q.edit_message_text(tr(update, "working"))
 
     try:
         out_path = await do_convert(job, code)
-        # أرسل الناتج
         await update.effective_chat.send_action(ChatAction.UPLOAD_DOCUMENT)
         with out_path.open("rb") as f:
             await update.effective_chat.send_document(
@@ -571,7 +503,6 @@ async def cb_convert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.exception("conversion error")
         await update.effective_chat.send_message(tr(update, "failed", err=str(e)[:200]))
     finally:
-        # نظّف
         try:
             if job.file_path.exists():
                 job.file_path.unlink(missing_ok=True)
@@ -583,20 +514,11 @@ async def cb_convert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATS_C += 1
 
 async def do_convert(job: Job, code: str) -> Path:
-    """ينفّذ التحويل ويعيد مسار الملف الناتج."""
     ext_map = {
-        "to_png": ".png",
-        "to_jpg": ".jpg",
-        "to_webp": ".webp",
-        "img2pdf": ".pdf",
-        "pdf2jpg": ".zip",
-        "pdf2png": ".zip",
-        "pdf2docx": ".docx",
-        "to_mp3": ".mp3",
-        "to_wav": ".wav",
-        "to_ogg": ".ogg",
-        "to_mp4": ".mp4",
-        "office2pdf": ".pdf",
+        "to_png": ".png", "to_jpg": ".jpg", "to_webp": ".webp",
+        "img2pdf": ".pdf", "pdf2jpg": ".zip", "pdf2png": ".zip",
+        "pdf2docx": ".docx", "to_mp3": ".mp3", "to_wav": ".wav",
+        "to_ogg": ".ogg", "to_mp4": ".mp4", "office2pdf": ".pdf",
     }
     out_path = job.file_path.parent / (Path(job.file_name).stem + ext_map.get(code, ".out"))
 
@@ -624,7 +546,6 @@ async def do_convert(job: Job, code: str) -> Path:
         if not BIN["ffmpeg"]:
             raise RuntimeError("ffmpeg غير متوفر")
         async with SEM_MEDIA:
-            # ffmpeg -i in -vn -acodec mp3 out
             if code in ("to_mp3", "to_wav", "to_ogg"):
                 acodec = {"to_mp3": "libmp3lame", "to_wav": "pcm_s16le", "to_ogg": "libvorbis"}[code]
                 cmd = [BIN["ffmpeg"], "-y", "-i", job.file_path.as_posix(),
@@ -662,12 +583,9 @@ async def do_convert(job: Job, code: str) -> Path:
 
     if not out_path.exists():
         raise RuntimeError("لم يُنتج ملف ناتج.")
+    return out_path.rename(out_path.with_name(clean_name(out_path.name)))
 
-    # تحجيم الاسم
-    out_path = out_path.rename(out_path.with_name(clean_name(out_path.name)))
-    return out_path
-
-# ====== إقلاع وحلّ قناة الاشتراك ======
+# ====== حلّ قناة الاشتراك ======
 
 async def resolve_channel(bot) -> None:
     """تحويل SUB_CHANNEL إلى chat_id و username نظيف."""
@@ -677,7 +595,6 @@ async def resolve_channel(bot) -> None:
         return
     # استخرج username
     if val.startswith("http"):
-        # https://t.me/<user>[/...]
         m = re.search(r"t\.me/([A-Za-z0-9_]+)", val)
         user = m.group(1) if m else val
     else:
@@ -691,11 +608,10 @@ async def resolve_channel(bot) -> None:
         CHANNEL_CHAT_ID = None
         CHANNEL_USERNAME_LINK = None
 
-# ====== Main ======
+# ====== on_startup + main ======
 
 async def on_startup(app: Application):
     await resolve_channel(app.bot)
-    # اضبط أوامر اللغات
     await app.bot.set_my_commands([
         BotCommand("start", "Start / اختر اللغة"),
         BotCommand("help", "Help / المساعدة"),
@@ -706,25 +622,23 @@ def main() -> None:
     app = build_app()
     app.post_init = on_startup
 
-    # تشغيل حسب النمط
     if IS_WEBHOOK and PUBLIC_URL:
-        # IMPORTANT: لا تضع سلاش في بداية url_path
-        path = "webhook"
+        path = "webhook"  # مهم: بدون '/' في البداية
         log.info("[http] serving on 0.0.0.0:%d (webhook)", PORT)
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            url_path=path,                              # <-- بدون '/'
+            url_path=path,
             webhook_url=f"{PUBLIC_URL}/{path}",
-            health_endpoint="/health",                  # Render health
-            # secret_token=os.getenv("WEBHOOK_SECRET"), # اختياري
+            health_endpoint="/health",  # Render health
+            # secret_token=os.getenv("WEBHOOK_SECRET"),  # اختياري
         )
     else:
         log.info("[polling] run_polling…")
         app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    log.info("PTB version at runtime: %s", Application.__module__.split(".")[0] + " 22.x")
+    log.info("PTB version at runtime: 22.x")
     main()
 
 
