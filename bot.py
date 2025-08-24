@@ -185,29 +185,7 @@ async def ensure_joined(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     await update.effective_message.reply_text(tr(update, "must_join"), reply_markup=btn)
     return False
 
-def build_app() -> Application:
-    if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN is missing")
-
-    application: Application = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # أوامر
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("help", cmd_help))
-    application.add_handler(CommandHandler("lang", cmd_lang))
-    application.add_handler(CommandHandler("formats", cmd_formats))
-    application.add_handler(CommandHandler("stats", cmd_stats))
-    application.add_handler(CommandHandler("debugsub", cmd_debugsub))
-
-    # كول باك
-    application.add_handler(CallbackQueryHandler(cb_lang, pattern=r"^lang:(ar|en)$"))
-    application.add_handler(CallbackQueryHandler(cb_convert, pattern=r"^conv:.+"))
-
-    # استقبال ملفات (تصحيح: filters.Document.ALL)
-    file_filter = (filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO)
-    application.add_handler(MessageHandler(file_filter, on_file))
-
-    return application
+# ========= Handlers =========
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([
@@ -588,13 +566,43 @@ async def resolve_channel(bot) -> None:
         CHANNEL_CHAT_ID = None
         CHANNEL_USERNAME_LINK = None
 
-async def on_startup(app: Application):
+async def _post_init(app: Application):
+    # يُستدعى تلقائياً بعد build()
     await resolve_channel(app.bot)
     await app.bot.set_my_commands([
         BotCommand("start", "Start / اختر اللغة"),
         BotCommand("help", "Help / المساعدة"),
         BotCommand("lang", "Language / تغيير اللغة"),
     ])
+
+def build_app() -> Application:
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN is missing")
+
+    application: Application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(_post_init)
+        .build()
+    )
+
+    # أوامر
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("lang", cmd_lang))
+    application.add_handler(CommandHandler("formats", cmd_formats))
+    application.add_handler(CommandHandler("stats", cmd_stats))
+    application.add_handler(CommandHandler("debugsub", cmd_debugsub))
+
+    # كول باك
+    application.add_handler(CallbackQueryHandler(cb_lang, pattern=r"^lang:(ar|en)$"))
+    application.add_handler(CallbackQueryHandler(cb_convert, pattern=r"^conv:.+"))
+
+    # استقبال ملفات (تصحيح: filters.Document.ALL)
+    file_filter = (filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO)
+    application.add_handler(MessageHandler(file_filter, on_file))
+
+    return application
 
 # -------- health server للـ Web Service في وضع polling --------
 def start_health_server():
@@ -616,44 +624,30 @@ def start_health_server():
 
     threading.Thread(target=_serve, daemon=True).start()
 
-# ---------- تشغيل Polling/Webhook بشكل صريح (متوافق مع Python 3.13) ----------
-async def _run_polling(app: Application):
-    await app.initialize()
-    await on_startup(app)
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    await app.updater.wait_until_closed()
-    await app.stop()
-    await app.shutdown()
-
-async def _run_webhook(app: Application, path: str):
-    await app.initialize()
-    await on_startup(app)
-    await app.start()
-    await app.updater.start_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=path,
-        webhook_url=f"{PUBLIC_URL}/{path}",
-    )
-    await app.updater.wait_until_closed()
-    await app.stop()
-    await app.shutdown()
-
+# ---------- التشغيل ----------
 def main() -> None:
     app = build_app()
+
+    # إصلاح Python 3.13: أنشئ event loop قبل run_*
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
     if MODE == "webhook" and PUBLIC_URL:
         log.info("PTB version at runtime: 22.x")
         log.info("CONFIG: MODE=webhook PUBLIC_URL=%s PORT=%s", PUBLIC_URL, PORT)
-        asyncio.run(_run_webhook(app, "webhook"))
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path="webhook",
+            webhook_url=f"{PUBLIC_URL}/webhook",
+            drop_pending_updates=True,
+        )
         return
 
     # polling + health server للبورت الخاص بـ Render
     log.info("PTB version at runtime: 22.x")
     log.info("CONFIG: MODE=polling PUBLIC_URL=%s PORT=%s", PUBLIC_URL or "-", PORT)
     start_health_server()
-    asyncio.run(_run_polling(app))
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
