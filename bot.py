@@ -8,7 +8,9 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -52,7 +54,7 @@ SUB_CHANNEL = os.getenv("SUB_CHANNEL", "").strip()  # @user أو user أو t.me/
 PUBLIC_URL = (os.getenv("PUBLIC_URL", "") or "").strip().rstrip("/")
 PORT = int(os.getenv("PORT", os.getenv("WEB_CONCURRENCY", "10000")))
 
-# MODE: webhook | polling (أي قيمة غير "webhook" تعني polling)
+# MODE: webhook | polling
 MODE = (os.getenv("MODE", "").strip().lower() or ("webhook" if PUBLIC_URL else "polling"))
 
 # حدود حجم تيليجرام
@@ -366,7 +368,7 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     tmpd = Path(tempfile.mkdtemp(prefix=f"u{update.effective_user.id}_", dir=WORK_ROOT))
-    in_path = tmpd / clean_name(fname)
+    in_path = tmpd / (SAFE_CHARS.sub("_", fname)[:128] or "file")
     fobj = await ctx.bot.get_file(file_id)
     await fobj.download_to_drive(in_path.as_posix())
 
@@ -564,7 +566,7 @@ async def do_convert(job: Job, code: str) -> Path:
 
     if not out_path.exists():
         raise RuntimeError("لم يُنتج ملف ناتج.")
-    return out_path.rename(out_path.with_name(clean_name(out_path.name)))
+    return out_path.rename(out_path.with_name(SAFE_CHARS.sub("_", out_path.name)[:128] or "out"))
 
 async def resolve_channel(bot) -> None:
     global CHANNEL_CHAT_ID, CHANNEL_USERNAME_LINK
@@ -594,37 +596,55 @@ async def on_startup(app: Application):
         BotCommand("lang", "Language / تغيير اللغة"),
     ])
 
+# -------- health server للـ Web Service في وضع polling --------
+def start_health_server():
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            return  # لا نكتب في اللوق
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            body = json.dumps({"ok": True, "mode": MODE}).encode()
+            self.wfile.write(body)
+
+    def _serve():
+        httpd = HTTPServer(("0.0.0.0", PORT), Handler)
+        log.info("[health] serving on 0.0.0.0:%s", PORT)
+        httpd.serve_forever()
+
+    threading.Thread(target=_serve, daemon=True).start()
+
 def main() -> None:
     app = build_app()
     app.post_init = on_startup
 
-    if MODE == "webhook":
-        if not PUBLIC_URL:
-            log.warning("MODE=webhook ولكن PUBLIC_URL فارغ؛ سيتم التحويل إلى polling.")
-        else:
-            path = "webhook"
-            log.info("[mode] webhook | url=%s/%s | port=%s", PUBLIC_URL, path, PORT)
-            app.run_webhook(
-                listen="0.0.0.0",
-                port=PORT,
-                url_path=path,
-                webhook_url=f"{PUBLIC_URL}/{path}",
-                # secret_token=os.getenv("WEBHOOK_SECRET"),  # اختياري
-            )
-            return
+    if MODE == "webhook" and PUBLIC_URL:
+        path = "webhook"
+        log.info("[mode] webhook | url=%s/%s | port=%s", PUBLIC_URL, path, PORT)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=path,
+            webhook_url=f"{PUBLIC_URL}/{path}",
+        )
+        return
 
-    # polling
-    log.info("[mode] polling | delete existing webhook then run_polling()")
-    try:
-        import asyncio as _a
-        loop = _a.get_event_loop()
-        loop.run_until_complete(app.bot.delete_webhook(drop_pending_updates=True))
-    except Exception:
-        pass
+    # polling + health server للبورت الخاص بـ Render
+    start_health_server()
+
+    async def _drop():
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=True)
+        except Exception:
+            pass
+
+    asyncio.run(_drop())
+    log.info("[mode] polling | health server up | running polling now")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     log.info("PTB version at runtime: 22.x")
     log.info("CONFIG: MODE=%s PUBLIC_URL=%s PORT=%s", MODE, PUBLIC_URL or "-", PORT)
     main()
-
