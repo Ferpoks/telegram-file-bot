@@ -36,7 +36,7 @@ from telegram.ext import (
     filters,
 )
 
-# ========= إعدادات عامة =========
+# ================= إعدادات عامة =================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,60 +44,59 @@ logging.basicConfig(
 )
 log = logging.getLogger("convbot")
 
-# متغيرات البيئة
+# بيئة
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "").lstrip("@")
-SUB_CHANNEL = os.getenv("SUB_CHANNEL", "").strip()          # @user أو user أو رابط t.me
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")         # مثال: https://telegram-file-bot-xxx.onrender.com
-PORT = int(os.getenv("PORT", "10000"))
+SUB_CHANNEL = os.getenv("SUB_CHANNEL", "").strip()  # @user أو user أو t.me/...
+PUBLIC_URL = (os.getenv("PUBLIC_URL", "") or "").strip().rstrip("/")
+PORT = int(os.getenv("PORT", os.getenv("WEB_CONCURRENCY", "10000")))
 
-# حدود حجم تيليجرام والملف
+# MODE: webhook | polling (أي قيمة غير "webhook" تعني polling)
+MODE = (os.getenv("MODE", "").strip().lower() or ("webhook" if PUBLIC_URL else "polling"))
+
+# حدود حجم تيليجرام
 TG_LIMIT_MB = int(os.getenv("TG_LIMIT_MB", "49"))
 TG_LIMIT = TG_LIMIT_MB * 1024 * 1024
 
-# التوازي (طلبت 20)
+# التوازي
 CONC_IMAGE = int(os.getenv("CONC_IMAGE", "20"))
 CONC_PDF   = int(os.getenv("CONC_PDF", "20"))
 CONC_MEDIA = int(os.getenv("CONC_MEDIA", "20"))
 CONC_OFFICE= int(os.getenv("CONC_OFFICE", "20"))
 
-# API اختياري لـ Office→PDF عند عدم وجود LibreOffice
+# PDF.co اختياري
 PDFCO_API_KEY = os.getenv("PDFCO_API_KEY", "").strip()
 
-# تشغيل Webhook إذا كان PUBLIC_URL موجود
-IS_WEBHOOK = bool(PUBLIC_URL)
-
-# مسارات عمل
 WORK_ROOT = Path("/tmp/convbot")
 WORK_ROOT.mkdir(parents=True, exist_ok=True)
 
-# كشف برامج النظام (قد تكون None)
+# برامج النظام
 BIN = {
-    "soffice": shutil.which("soffice"),     # LibreOffice
-    "pdftoppm": shutil.which("pdftoppm"),   # Poppler
+    "soffice": shutil.which("soffice"),
+    "pdftoppm": shutil.which("pdftoppm"),
     "ffmpeg": shutil.which("ffmpeg"),
-    "gs": shutil.which("gs"),               # GhostScript
+    "gs": shutil.which("gs"),
 }
 log.info("[bin] soffice=%s, pdftoppm=%s, ffmpeg=%s, gs=%s (limit=%dMB)",
          BIN["soffice"], BIN["pdftoppm"], BIN["ffmpeg"], BIN["gs"], TG_LIMIT_MB)
 
 SAFE_CHARS = re.compile(r"[^A-Za-z0-9_.\- ]+")
 
-# لغة المستخدم البسيطة بالذاكرة
+# لغات
 USER_LANG: Dict[int, str] = {}
 
-# Semaphores للتوازي
+# Semaphores
 SEM_IMAGE = asyncio.Semaphore(CONC_IMAGE)
 SEM_PDF   = asyncio.Semaphore(CONC_PDF)
 SEM_MEDIA = asyncio.Semaphore(CONC_MEDIA)
 SEM_OFFICE= asyncio.Semaphore(CONC_OFFICE)
 
-# معلومات قناة الاشتراك بعد الحلّ
+# اشتراك القناة
 CHANNEL_CHAT_ID: Optional[int] = None
 CHANNEL_USERNAME_LINK: Optional[str] = None  # t.me/<user>
 
-# ====== ترجمات بسيطة ======
+# ترجمات
 T = {
     "ar": {
         "start_title": "👋 أهلاً بك!",
@@ -147,7 +146,7 @@ T = {
     },
 }
 
-# ====== أدوات مساعدة ======
+# ===== أدوات مساعدة =====
 
 def lang_of(update: Update) -> str:
     uid = update.effective_user.id if update.effective_user else 0
@@ -167,10 +166,8 @@ def clean_name(name: str) -> str:
     return safe[:128] or "file"
 
 async def ensure_joined(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
-    """يتأكد أن المستخدم مشترك بالقناة قبل السماح بالاستعمال."""
     global CHANNEL_CHAT_ID, CHANNEL_USERNAME_LINK
     if not CHANNEL_CHAT_ID:
-        # لم يتم تفعيل الاشتراط
         return True
     user = update.effective_user
     if not user:
@@ -188,7 +185,7 @@ async def ensure_joined(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     await update.effective_message.reply_text(tr(update, "must_join"), reply_markup=btn)
     return False
 
-# ====== إنشاء التطبيق ومعالجاته ======
+# ===== إنشاء التطبيق =====
 
 def build_app() -> Application:
     if not BOT_TOKEN:
@@ -204,20 +201,19 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("stats", cmd_stats))
     application.add_handler(CommandHandler("debugsub", cmd_debugsub))
 
-    # أزرار اختيار اللغة والتحويل
+    # كول باك
     application.add_handler(CallbackQueryHandler(cb_lang, pattern=r"^lang:(ar|en)$"))
     application.add_handler(CallbackQueryHandler(cb_convert, pattern=r"^conv:.+"))
 
-    # استقبال الملفات — التصحيح هنا: استخدم filters.Document.ALL
+    # استقبال ملفات (تصحيح: filters.Document.ALL)
     file_filter = (filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO)
     application.add_handler(MessageHandler(file_filter, on_file))
 
     return application
 
-# ====== أوامر ======
+# ===== أوامر =====
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # دائماً أعرض اختيار اللغة عند /start
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(T["ar"]["btn_ar"], callback_data="lang:ar"),
          InlineKeyboardButton(T["en"]["btn_en"], callback_data="lang:en")]
@@ -270,7 +266,6 @@ async def cmd_formats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append("• Audio ⇄ MP3/WAV/OGG, Video → MP4")
     await update.effective_message.reply_text(f"{tr(update, 'formats_title')}\n\n" + "\n".join(lines))
 
-# إحصائيات بسيطة بالذاكرة
 STATS_U = set()
 STATS_C = 0
 
@@ -285,10 +280,10 @@ async def cmd_debugsub(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(tr(update, "admin_only"))
         return
     await update.effective_message.reply_text(
-        f"SUB_CHANNEL parsed: @{CHANNEL_USERNAME_LINK or '-'}\nCHAT_ID: {CHANNEL_CHAT_ID}"
+        f"MODE={MODE}\nPUBLIC_URL={PUBLIC_URL or '-'}\nSUB_CHANNEL=@{CHANNEL_USERNAME_LINK or '-'}\nCHAT_ID={CHANNEL_CHAT_ID}"
     )
 
-# ====== استقبال الملفات ======
+# ===== استقبال الملفات =====
 
 def detect_kind(filename: str, mime: Optional[str]) -> str:
     ext = Path(filename).suffix.lower().strip(".")
@@ -341,7 +336,6 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     msg = update.effective_message
 
-    # احصل على الملف من أي نوع
     if msg.document:
         tgfile = msg.document
         size = tgfile.file_size or 0
@@ -379,7 +373,6 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("لا توجد تحويلات مناسبة لهذا النوع حالياً.")
         return
 
-    # تنزيل إلى مجلد مؤقت
     tmpd = Path(tempfile.mkdtemp(prefix=f"u{update.effective_user.id}_", dir=WORK_ROOT))
     in_path = tmpd / clean_name(fname)
     fobj = await ctx.bot.get_file(file_id)
@@ -397,7 +390,7 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await msg.reply_text(tr(update, "choose_action"), reply_markup=InlineKeyboardMarkup(kb))
 
-# ====== تنفيذ التحويلات ======
+# ===== التحويلات =====
 
 async def run_cmd(cmd: list, cwd=None, timeout=600) -> Tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
@@ -470,7 +463,7 @@ async def office_to_pdf(in_path: Path, out_path: Path):
 
     raise RuntimeError("Office→PDF غير متاح: لا يوجد LibreOffice ولا PDF.co API")
 
-# ====== تنفيذ ضغط الزر ======
+# ===== أزرار التحويل =====
 
 async def cb_convert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global STATS_C
@@ -585,15 +578,14 @@ async def do_convert(job: Job, code: str) -> Path:
         raise RuntimeError("لم يُنتج ملف ناتج.")
     return out_path.rename(out_path.with_name(clean_name(out_path.name)))
 
-# ====== حلّ قناة الاشتراك ======
+# ===== اشتراط الاشتراك =====
 
 async def resolve_channel(bot) -> None:
-    """تحويل SUB_CHANNEL إلى chat_id و username نظيف."""
+    """حوّل SUB_CHANNEL إلى chat_id و username"""
     global CHANNEL_CHAT_ID, CHANNEL_USERNAME_LINK
     val = SUB_CHANNEL.strip()
     if not val:
         return
-    # استخرج username
     if val.startswith("http"):
         m = re.search(r"t\.me/([A-Za-z0-9_]+)", val)
         user = m.group(1) if m else val
@@ -603,12 +595,13 @@ async def resolve_channel(bot) -> None:
         chat = await bot.get_chat(f"@{user}")
         CHANNEL_CHAT_ID = chat.id
         CHANNEL_USERNAME_LINK = user
+        log.info("[sub] channel resolved: @%s (id=%s)", user, CHANNEL_CHAT_ID)
     except Exception as e:
         log.warning("resolve_channel failed for %s: %s", val, e)
         CHANNEL_CHAT_ID = None
         CHANNEL_USERNAME_LINK = None
 
-# ====== on_startup + main ======
+# ===== startup + main =====
 
 async def on_startup(app: Application):
     await resolve_channel(app.bot)
@@ -622,23 +615,35 @@ def main() -> None:
     app = build_app()
     app.post_init = on_startup
 
-    if IS_WEBHOOK and PUBLIC_URL:
-        path = "webhook"  # مهم: بدون '/' في البداية
-        log.info("[http] serving on 0.0.0.0:%d (webhook)", PORT)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=path,
-            webhook_url=f"{PUBLIC_URL}/{path}",
-            health_endpoint="/health",  # Render health
-            # secret_token=os.getenv("WEBHOOK_SECRET"),  # اختياري
-        )
-    else:
-        log.info("[polling] run_polling…")
-        app.run_polling(drop_pending_updates=True)
+    if MODE == "webhook":
+        if not PUBLIC_URL:
+            log.warning("MODE=webhook ولكن PUBLIC_URL فارغ؛ سيتم التحويل إلى polling.")
+        else:
+            path = "webhook"
+            log.info("[mode] webhook | url=%s/%s | port=%s", PUBLIC_URL, path, PORT)
+            app.run_webhook(
+                listen="0.0.0.0",
+                port=PORT,
+                url_path=path,
+                webhook_url=f"{PUBLIC_URL}/{path}",
+                health_endpoint="/health",
+            )
+            return
+
+    # polling
+    log.info("[mode] polling | delete existing webhook then run_polling()")
+    # تأكد إزالة أي webhook قديم
+    try:
+        import asyncio as _a
+        loop = _a.get_event_loop()
+        loop.run_until_complete(app.bot.delete_webhook(drop_pending_updates=True))
+    except Exception:
+        pass
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     log.info("PTB version at runtime: 22.x")
+    log.info("CONFIG: MODE=%s PUBLIC_URL=%s PORT=%s", MODE, PUBLIC_URL or "-", PORT)
     main()
 
 
