@@ -616,35 +616,45 @@ def start_health_server():
 
     threading.Thread(target=_serve, daemon=True).start()
 
+# ---------- تشغيل Polling/Webhook بشكل صريح (متوافق مع Python 3.13) ----------
+async def _run_polling(app: Application):
+    await app.initialize()
+    await on_startup(app)
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    await app.updater.wait_until_closed()
+    await app.stop()
+    await app.shutdown()
+
+async def _run_webhook(app: Application, path: str):
+    await app.initialize()
+    await on_startup(app)
+    await app.start()
+    await app.updater.start_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=path,
+        webhook_url=f"{PUBLIC_URL}/{path}",
+    )
+    await app.updater.wait_until_closed()
+    await app.stop()
+    await app.shutdown()
+
 def main() -> None:
     app = build_app()
-    app.post_init = on_startup
 
     if MODE == "webhook" and PUBLIC_URL:
-        path = "webhook"
-        log.info("[mode] webhook | url=%s/%s | port=%s", PUBLIC_URL, path, PORT)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=path,
-            webhook_url=f"{PUBLIC_URL}/{path}",
-        )
+        log.info("PTB version at runtime: 22.x")
+        log.info("CONFIG: MODE=webhook PUBLIC_URL=%s PORT=%s", PUBLIC_URL, PORT)
+        asyncio.run(_run_webhook(app, "webhook"))
         return
 
     # polling + health server للبورت الخاص بـ Render
+    log.info("PTB version at runtime: 22.x")
+    log.info("CONFIG: MODE=polling PUBLIC_URL=%s PORT=%s", PUBLIC_URL or "-", PORT)
     start_health_server()
-
-    async def _drop():
-        try:
-            await app.bot.delete_webhook(drop_pending_updates=True)
-        except Exception:
-            pass
-
-    asyncio.run(_drop())
-    log.info("[mode] polling | health server up | running polling now")
-    app.run_polling(drop_pending_updates=True)
+    asyncio.run(_run_polling(app))
 
 if __name__ == "__main__":
-    log.info("PTB version at runtime: 22.x")
-    log.info("CONFIG: MODE=%s PUBLIC_URL=%s PORT=%s", MODE, PUBLIC_URL or "-", PORT)
     main()
+
