@@ -146,8 +146,6 @@ T = {
     },
 }
 
-# ===== أدوات مساعدة =====
-
 def lang_of(update: Update) -> str:
     uid = update.effective_user.id if update.effective_user else 0
     return USER_LANG.get(uid, "ar")
@@ -185,8 +183,6 @@ async def ensure_joined(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     await update.effective_message.reply_text(tr(update, "must_join"), reply_markup=btn)
     return False
 
-# ===== إنشاء التطبيق =====
-
 def build_app() -> Application:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is missing")
@@ -210,8 +206,6 @@ def build_app() -> Application:
     application.add_handler(MessageHandler(file_filter, on_file))
 
     return application
-
-# ===== أوامر =====
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([
@@ -282,8 +276,6 @@ async def cmd_debugsub(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"MODE={MODE}\nPUBLIC_URL={PUBLIC_URL or '-'}\nSUB_CHANNEL=@{CHANNEL_USERNAME_LINK or '-'}\nCHAT_ID={CHANNEL_CHAT_ID}"
     )
-
-# ===== استقبال الملفات =====
 
 def detect_kind(filename: str, mime: Optional[str]) -> str:
     ext = Path(filename).suffix.lower().strip(".")
@@ -390,8 +382,6 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await msg.reply_text(tr(update, "choose_action"), reply_markup=InlineKeyboardMarkup(kb))
 
-# ===== التحويلات =====
-
 async def run_cmd(cmd: list, cwd=None, timeout=600) -> Tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=cwd
@@ -462,8 +452,6 @@ async def office_to_pdf(in_path: Path, out_path: Path):
         return
 
     raise RuntimeError("Office→PDF غير متاح: لا يوجد LibreOffice ولا PDF.co API")
-
-# ===== أزرار التحويل =====
 
 async def cb_convert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global STATS_C
@@ -578,10 +566,7 @@ async def do_convert(job: Job, code: str) -> Path:
         raise RuntimeError("لم يُنتج ملف ناتج.")
     return out_path.rename(out_path.with_name(clean_name(out_path.name)))
 
-# ===== اشتراط الاشتراك =====
-
 async def resolve_channel(bot) -> None:
-    """حوّل SUB_CHANNEL إلى chat_id و username"""
     global CHANNEL_CHAT_ID, CHANNEL_USERNAME_LINK
     val = SUB_CHANNEL.strip()
     if not val:
@@ -600,8 +585,6 @@ async def resolve_channel(bot) -> None:
         log.warning("resolve_channel failed for %s: %s", val, e)
         CHANNEL_CHAT_ID = None
         CHANNEL_USERNAME_LINK = None
-
-# ===== startup + main =====
 
 async def on_startup(app: Application):
     await resolve_channel(app.bot)
@@ -626,13 +609,12 @@ def main() -> None:
                 port=PORT,
                 url_path=path,
                 webhook_url=f"{PUBLIC_URL}/{path}",
-                health_endpoint="/health",
+                # secret_token=os.getenv("WEBHOOK_SECRET"),  # اختياري
             )
             return
 
     # polling
     log.info("[mode] polling | delete existing webhook then run_polling()")
-    # تأكد إزالة أي webhook قديم
     try:
         import asyncio as _a
         loop = _a.get_event_loop()
@@ -645,5 +627,4 @@ if __name__ == "__main__":
     log.info("PTB version at runtime: 22.x")
     log.info("CONFIG: MODE=%s PUBLIC_URL=%s PORT=%s", MODE, PUBLIC_URL or "-", PORT)
     main()
-
 
