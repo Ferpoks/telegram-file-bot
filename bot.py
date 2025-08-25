@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import httpx
+import fitz  # PyMuPDF
 from pdf2image import convert_from_path
 from pdf2docx import parse as pdf2docx_parse
 from PIL import Image
@@ -102,9 +103,9 @@ CHANNEL_USERNAME_LINK: Optional[str] = None  # t.me/<user>
 T = {
     "ar": {
         "start_title": "👋 أهلاً بك!",
-        "start_desc": ("أنا بوت تحويل ملفات. اختر لغتك ثم أرسل أي ملف وسأعرض لك صيغ التحويل المتاحة.\n\n"
-                       "المدعوم: صور PNG/JPG/WEBP ⇄ PDF، PDF ⇢ صور/ DOCX، صوت ⇄ MP3/WAV/OGG، فيديو ⇢ MP4.\n"
-                       "تحويل أوفيس → PDF متاح إذا كان LibreOffice موجوداً أو لديك مفتاح PDF.co."),
+        "start_desc": ("أنا بوت تحويل وضغط الملفات. اختر لغتك ثم أرسل أي ملف.\n\n"
+                       "التحويل: صور PNG/JPG/WEBP ⇄ PDF، PDF ⇢ صور/ DOCX، صوت ⇄ MP3/WAV/OGG، فيديو ⇢ MP4، أوفيس ⇢ PDF.\n"
+                       "الضغط: صور/فيديو/صوت/PDF/ملفات أخرى بنسبة 10% → 90% (أعلى نسبة = ملف أصغر/جودة أقل)."),
         "choose_lang": "اختر اللغة:",
         "btn_ar": "العربية 🇸🇦",
         "btn_en": "English 🇬🇧",
@@ -113,21 +114,26 @@ T = {
         "join_btn": "الانضمام للقناة",
         "joined_ok": "✅ تم التحقق من الاشتراك. أرسل ملفك الآن.",
         "file_too_big": "❌ الملف أكبر من الحد المسموح ({mb}MB).",
+        "choose_section": "اختر القسم:",
+        "sec_convert": "🔁 تحويل الملفات",
+        "sec_compress": "🗜️ ضغط الملفات",
         "choose_action": "ماذا تريد أن أفعل بهذا الملف؟",
-        "working": "⏳ يتم التحويل، انتظر من فضلك…",
-        "failed": "❌ حدث خطأ أثناء التحويل: {err}",
+        "choose_ratio": "اختر نسبة الضغط:",
+        "working": "⏳ يتم التنفيذ، انتظر من فضلك…",
+        "failed": "❌ حدث خطأ: {err}",
         "sent": "✅ تم الإرسال.",
         "admin_only": "هذا الأمر للمدير فقط.",
-        "formats_title": "صيَغ التحويل المتاحة حالياً:",
-        "stats": "📊 إحصائيات سريعة:\nمستخدمون فريدون تقريباً: {u}\nمحاولات تحويل: {c}",
+        "formats_title": "الصيغ المتاحة للتحويل:",
+        "stats": "📊 إحصائيات سريعة:\nمستخدمون فريدون تقريباً: {u}\nعمليات: {c}",
         "lang_saved": "✅ تم ضبط اللغة على العربية.",
         "lang_prompt": "↪️ اختر لغتك من الأزرار.",
+        "no_gs": "⚠️ ضغط PDF يتطلب Ghostscript. تم استخدام ضغط بديل وقد لا يكون الأفضل.",
     },
     "en": {
         "start_title": "👋 Welcome!",
-        "start_desc": ("I'm a file converter bot. Pick your language, then send a file and I'll show you the available conversions.\n\n"
-                       "Supported: Images PNG/JPG/WEBP ⇄ PDF, PDF ⇢ images/DOCX, audio ⇄ MP3/WAV/OGG, video ⇢ MP4.\n"
-                       "Office → PDF is available if LibreOffice exists or you set a PDF.co API key."),
+        "start_desc": ("I'm a file conversion & compression bot. Pick your language then send any file.\n\n"
+                       "Convert: Images PNG/JPG/WEBP ⇄ PDF, PDF ⇢ images/DOCX, audio ⇄ MP3/WAV/OGG, video ⇢ MP4, Office ⇢ PDF.\n"
+                       "Compress: images/video/audio/PDF/others with 10% → 90% (higher = smaller/lower quality)."),
         "choose_lang": "Choose a language:",
         "btn_ar": "العربية 🇸🇦",
         "btn_en": "English 🇬🇧",
@@ -136,15 +142,20 @@ T = {
         "join_btn": "Join channel",
         "joined_ok": "✅ Subscription verified. Send your file.",
         "file_too_big": "❌ File exceeds allowed limit ({mb}MB).",
+        "choose_section": "Pick a section:",
+        "sec_convert": "🔁 Convert",
+        "sec_compress": "🗜️ Compress",
         "choose_action": "What do you want to do with this file?",
-        "working": "⏳ Converting, please wait…",
-        "failed": "❌ Conversion error: {err}",
+        "choose_ratio": "Pick compression ratio:",
+        "working": "⏳ Working, please wait…",
+        "failed": "❌ Error: {err}",
         "sent": "✅ Sent.",
         "admin_only": "This command is admin-only.",
-        "formats_title": "Currently supported conversions:",
-        "stats": "📊 Quick stats:\nApprox unique users: {u}\nConversions: {c}",
+        "formats_title": "Supported conversions:",
+        "stats": "📊 Quick stats:\nApprox unique users: {u}\nOps: {c}",
         "lang_saved": "✅ Language set to English.",
         "lang_prompt": "↪️ Pick your language via buttons.",
+        "no_gs": "⚠️ PDF compression needs Ghostscript. Used fallback compression which may be weaker.",
     },
 }
 
@@ -238,6 +249,7 @@ async def cmd_formats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append("• Office → PDF (غير متاح حالياً: يحتاج LibreOffice أو PDF.co)")
     if BIN["ffmpeg"]:
         lines.append("• Audio ⇄ MP3/WAV/OGG, Video → MP4")
+    lines.append("• Compression: Images/PDF/Audio/Video/Other (10%→90%)")
     await update.effective_message.reply_text(f"{tr(update, 'formats_title')}\n\n" + "\n".join(lines))
 
 STATS_U = set()
@@ -300,6 +312,8 @@ class Job:
 
 JOBS: Dict[str, Job] = {}
 
+# ======== استقبال الملف وإظهار اختيار القسم ========
+
 async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await ensure_joined(update, ctx):
         return
@@ -340,11 +354,6 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     kind = detect_kind(fname, mime)
-    options = conv_options(kind)
-    if not options:
-        await msg.reply_text("لا توجد تحويلات مناسبة لهذا النوع حالياً.")
-        return
-
     tmpd = Path(tempfile.mkdtemp(prefix=f"u{update.effective_user.id}_", dir=WORK_ROOT))
     in_path = tmpd / (SAFE_CHARS.sub("_", fname)[:128] or "file")
     fobj = await ctx.bot.get_file(file_id)
@@ -353,14 +362,13 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     token = os.urandom(6).hex()
     JOBS[token] = Job(update.effective_user.id, kind, in_path, in_path.name)
 
-    kb, row = [], []
-    for text, code in options:
-        row.append(InlineKeyboardButton(text, callback_data=f"conv:{token}:{code}"))
-        if len(row) == 3:
-            kb.append(row); row = []
-    if row: kb.append(row)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(tr(update, "sec_convert"), callback_data=f"mode:{token}:conv")],
+        [InlineKeyboardButton(tr(update, "sec_compress"), callback_data=f"mode:{token}:zip")],
+    ])
+    await msg.reply_text(tr(update, "choose_section"), reply_markup=kb)
 
-    await msg.reply_text(tr(update, "choose_action"), reply_markup=InlineKeyboardMarkup(kb))
+# ======== تشغيل أوامر النظام ========
 
 async def run_cmd(cmd: list, cwd=None, timeout=600) -> Tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
@@ -368,6 +376,8 @@ async def run_cmd(cmd: list, cwd=None, timeout=600) -> Tuple[int, str, str]:
     )
     out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     return proc.returncode, out_b.decode("utf-8", "ignore"), err_b.decode("utf-8", "ignore")
+
+# ======== تحويل ========
 
 async def image_to_pdf(in_path: Path, out_path: Path):
     with Image.open(in_path) as im:
@@ -433,6 +443,168 @@ async def office_to_pdf(in_path: Path, out_path: Path):
 
     raise RuntimeError("Office→PDF غير متاح: لا يوجد LibreOffice ولا PDF.co API")
 
+# ======== ضغط ========
+
+def _std_bitrate(kbps: int) -> int:
+    # أقرب قيمة شائعة
+    std = [320,256,192,160,128,112,96,80,64,48,32]
+    return min(std, key=lambda x: abs(x-kbps))
+
+def _map_audio_bitrate(pct: int) -> int:
+    # 10% ≈ 256k  ... 90% ≈ 32k
+    est = int(320 * (1 - pct/100.0))
+    return max(32, _std_bitrate(est))
+
+def _map_video_crf(pct: int) -> int:
+    # 10%≈22 , 20%≈24 , ... 90%≈38
+    return int(min(38, max(18, 18 + pct//3)))
+
+def _map_jpeg_quality(pct: int) -> int:
+    # 10%≈90 ... 90%≈25
+    return int(max(25, 100 - pct))
+
+def _map_webp_quality(pct: int) -> int:
+    return int(max(25, 100 - pct))
+
+def _map_png_compresslevel(pct: int) -> int:
+    # 0..9
+    return int(min(9, round((pct/100)*9)))
+
+def _map_pdf_res(pct: int) -> int:
+    # 10%≈300dpi ... 90%≈72dpi
+    return int(max(72, 300 - (pct * (300-72))//100))
+
+def _map_pdf_jpegq(pct: int) -> int:
+    # 10%≈95 ... 90%≈35
+    return int(max(35, 100 - int(pct*0.6)))
+
+async def compress_image(in_path: Path, pct: int, out_path: Path):
+    with Image.open(in_path) as im:
+        ext = in_path.suffix.lower()
+        if ext in (".jpg", ".jpeg"):
+            q = _map_jpeg_quality(pct)
+            if im.mode in ("RGBA", "P"):
+                im = im.convert("RGB")
+            im.save(out_path.with_suffix(".jpg"), quality=q, optimize=True, progressive=True)
+            return out_path.with_suffix(".jpg")
+        elif ext in (".webp",):
+            q = _map_webp_quality(pct)
+            im.save(out_path.with_suffix(".webp"), quality=q, method=6)
+            return out_path.with_suffix(".webp")
+        else:
+            # PNG أو غيره → PNG بضغط أعلى (lossless)
+            cl = _map_png_compresslevel(pct)
+            im.save(out_path.with_suffix(".png"), optimize=True, compress_level=cl)
+            return out_path.with_suffix(".png")
+
+async def compress_pdf(in_path: Path, pct: int, out_path: Path):
+    if BIN["gs"]:
+        dpi = _map_pdf_res(pct)
+        q = _map_pdf_jpegq(pct)
+        cmd = [
+            BIN["gs"], "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            "-dNOPAUSE", "-dQUIET", "-dBATCH",
+            "-dDownsampleColorImages=true",
+            f"-dColorImageResolution={dpi}",
+            "-dColorImageDownsampleType=/Average",
+            f"-dJPEGQ={q}",
+            f"-sOutputFile={out_path.as_posix()}",
+            in_path.as_posix()
+        ]
+        code, out, err = await run_cmd(cmd, timeout=900)
+        if code != 0 or not out_path.exists():
+            raise RuntimeError(err or out or "gs failed")
+        return out_path
+    # Fallback: PyMuPDF (أضعف)
+    try:
+        doc = fitz.open(in_path.as_posix())
+        # لا توجد API مباشرة للجودة، لكن نستخدم تنظيف + ضغط
+        doc.save(out_path.as_posix(), deflate=True, garbage=3)
+        doc.close()
+        if not out_path.exists():
+            raise RuntimeError("fallback failed")
+        return out_path
+    except Exception:
+        raise RuntimeError("ضغط PDF غير متاح (لا gs)، حاول نسبة أقل أو فعّل gs.")
+
+async def compress_audio(in_path: Path, pct: int, out_path: Path):
+    if not BIN["ffmpeg"]:
+        raise RuntimeError("ffmpeg غير متوفر")
+    br = _map_audio_bitrate(pct)
+    # نعيد الترميز إلى mp3
+    dst = out_path.with_suffix(".mp3")
+    cmd = [BIN["ffmpeg"], "-y", "-i", in_path.as_posix(), "-vn", "-b:a", f"{br}k", dst.as_posix()]
+    code, out, err = await run_cmd(cmd)
+    if code != 0 or not dst.exists():
+        raise RuntimeError(err or out)
+    return dst
+
+async def compress_video(in_path: Path, pct: int, out_path: Path):
+    if not BIN["ffmpeg"]:
+        raise RuntimeError("ffmpeg غير متوفر")
+    crf = _map_video_crf(pct)
+    dst = out_path.with_suffix(".mp4")
+    cmd = [
+        BIN["ffmpeg"], "-y", "-i", in_path.as_posix(),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+        dst.as_posix()
+    ]
+    code, out, err = await run_cmd(cmd, timeout=3600)
+    if code != 0 or not dst.exists():
+        raise RuntimeError(err or out)
+    return dst
+
+async def compress_other_zip(in_path: Path, pct: int, out_path: Path):
+    import zipfile
+    lvl = min(9, max(1, round((pct/100)*9)))
+    dst = out_path.with_suffix(".zip")
+    with zipfile.ZipFile(dst, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=lvl) as z:
+        z.write(in_path.as_posix(), arcname=in_path.name)
+    return dst
+
+# ======== كولباك لاختيار القسم/التحويل/الضغط ========
+
+def _percent_keyboard(token: str, update: Update) -> InlineKeyboardMarkup:
+    steps = [10,20,30,40,50,60,70,80,90]
+    rows, row = [], []
+    for s in steps:
+        row.append(InlineKeyboardButton(f"{s}%", callback_data=f"zip:{token}:{s}"))
+        if len(row) == 3:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+async def cb_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        _, token, mode = q.data.split(":")
+    except Exception:
+        return
+    job = JOBS.get(token)
+    if not job or job.user_id != q.from_user.id:
+        await q.edit_message_text("انتهت صلاحية العملية. أعد إرسال الملف.")
+        return
+
+    if mode == "conv":
+        # اعرض خيارات التحويل القديمة حسب النوع
+        options = conv_options(job.kind)
+        if not options:
+            await q.edit_message_text("لا توجد تحويلات مناسبة لهذا النوع حالياً.")
+            return
+        kb, row = [], []
+        for text, code in options:
+            row.append(InlineKeyboardButton(text, callback_data=f"conv:{token}:{code}"))
+            if len(row) == 3:
+                kb.append(row); row = []
+        if row: kb.append(row)
+        await q.edit_message_text(tr(update, "choose_action"), reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        # ضغط
+        await q.edit_message_text(tr(update, "choose_ratio"), reply_markup=_percent_keyboard(token, update))
+
 async def cb_convert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global STATS_C
     q = update.callback_query
@@ -442,7 +614,7 @@ async def cb_convert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         return
 
-    job = JOBS.pop(token, None)
+    job = JOBS.get(token)
     if not job:
         await q.edit_message_text("انتهت صلاحية هذه العملية، أعد إرسال الملف.")
         return
@@ -464,6 +636,7 @@ async def cb_convert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.exception("conversion error")
         await update.effective_chat.send_message(tr(update, "failed", err=str(e)[:200]))
     finally:
+        # نظّف وحذف التوكن
         try:
             if job.file_path.exists():
                 job.file_path.unlink(missing_ok=True)
@@ -471,8 +644,57 @@ async def cb_convert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 shutil.rmtree(job.file_path.parent, ignore_errors=True)
         except Exception:
             pass
+        JOBS.pop(token, None)
 
     STATS_C += 1
+
+async def cb_compress(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global STATS_C
+    q = update.callback_query
+    await q.answer()
+    try:
+        _, token, pct = q.data.split(":")
+        pct = int(pct)
+    except Exception:
+        return
+
+    job = JOBS.get(token)
+    if not job:
+        await q.edit_message_text("انتهت صلاحية هذه العملية، أعد إرسال الملف.")
+        return
+    if job.user_id != q.from_user.id:
+        await q.edit_message_text("هذه العملية ليست لك.")
+        return
+
+    await q.edit_message_text(tr(update, "working"))
+
+    try:
+        out_path = await do_compress(job, pct)
+        await update.effective_chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+        with out_path.open("rb") as f:
+            await update.effective_chat.send_document(
+                document=InputFile(f, filename=out_path.name),
+                caption=tr(update, "sent"),
+            )
+    except Exception as e:
+        log.exception("compress error")
+        msg = str(e)[:200]
+        if job.kind == "pdf" and not BIN["gs"]:
+            msg = tr(update, "no_gs")
+        await update.effective_chat.send_message(tr(update, "failed", err=msg))
+    finally:
+        try:
+            if job.file_path.exists():
+                job.file_path.unlink(missing_ok=True)
+            if job.file_path.parent.exists():
+                shutil.rmtree(job.file_path.parent, ignore_errors=True)
+        except Exception:
+            pass
+        JOBS.pop(token, None)
+
+    STATS_C += 1
+
+# ======== تنفيذ التحويل/الضغط ========
 
 async def do_convert(job: Job, code: str) -> Path:
     ext_map = {
@@ -546,6 +768,25 @@ async def do_convert(job: Job, code: str) -> Path:
         raise RuntimeError("لم يُنتج ملف ناتج.")
     return out_path.rename(out_path.with_name(SAFE_CHARS.sub("_", out_path.name)[:128] or "out"))
 
+async def do_compress(job: Job, pct: int) -> Path:
+    base = job.file_path.parent / (Path(job.file_name).stem + f"_compressed_{pct}")
+    if job.kind == "image":
+        async with SEM_IMAGE:
+            return await compress_image(job.file_path, pct, base)
+    if job.kind == "pdf":
+        async with SEM_PDF:
+            return await compress_pdf(job.file_path, pct, base.with_suffix(".pdf"))
+    if job.kind == "audio":
+        async with SEM_MEDIA:
+            return await compress_audio(job.file_path, pct, base)
+    if job.kind == "video":
+        async with SEM_MEDIA:
+            return await compress_video(job.file_path, pct, base)
+    # office/other → zip
+    return await compress_other_zip(job.file_path, pct, base)
+
+# ======== تهيئة القناة/الأوامر ========
+
 async def resolve_channel(bot) -> None:
     global CHANNEL_CHAT_ID, CHANNEL_USERNAME_LINK
     val = SUB_CHANNEL.strip()
@@ -567,12 +808,13 @@ async def resolve_channel(bot) -> None:
         CHANNEL_USERNAME_LINK = None
 
 async def _post_init(app: Application):
-    # يُستدعى تلقائياً بعد build()
     await resolve_channel(app.bot)
     await app.bot.set_my_commands([
         BotCommand("start", "Start / اختر اللغة"),
         BotCommand("help", "Help / المساعدة"),
         BotCommand("lang", "Language / تغيير اللغة"),
+        BotCommand("formats", "Admin: الصيغ (للمدير)"),
+        BotCommand("stats", "Admin: إحصائيات"),
     ])
 
 def build_app() -> Application:
@@ -596,9 +838,11 @@ def build_app() -> Application:
 
     # كول باك
     application.add_handler(CallbackQueryHandler(cb_lang, pattern=r"^lang:(ar|en)$"))
+    application.add_handler(CallbackQueryHandler(cb_mode, pattern=r"^mode:.+"))
     application.add_handler(CallbackQueryHandler(cb_convert, pattern=r"^conv:.+"))
+    application.add_handler(CallbackQueryHandler(cb_compress, pattern=r"^zip:.+"))
 
-    # استقبال ملفات (تصحيح: filters.Document.ALL)
+    # استقبال ملفات
     file_filter = (filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO)
     application.add_handler(MessageHandler(file_filter, on_file))
 
@@ -609,7 +853,6 @@ def start_health_server():
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             return  # لا نكتب في اللوق
-
         def do_GET(self):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
