@@ -443,40 +443,33 @@ async def office_to_pdf(in_path: Path, out_path: Path):
 
     raise RuntimeError("Office→PDF غير متاح: لا يوجد LibreOffice ولا PDF.co API")
 
-# ======== ضغط ========
-
-def _std_bitrate(kbps: int) -> int:
-    # أقرب قيمة شائعة
-    std = [320,256,192,160,128,112,96,80,64,48,32]
-    return min(std, key=lambda x: abs(x-kbps))
+# ======== أدوات الخرائط للجودة/الدقة ========
 
 def _map_audio_bitrate(pct: int) -> int:
-    # 10% ≈ 256k  ... 90% ≈ 32k
+    std = [320,256,192,160,128,112,96,80,64,48,32]
     est = int(320 * (1 - pct/100.0))
-    return max(32, _std_bitrate(est))
+    est = max(32, est)
+    return min(std, key=lambda x: abs(x-est))
 
 def _map_video_crf(pct: int) -> int:
-    # 10%≈22 , 20%≈24 , ... 90%≈38
     return int(min(38, max(18, 18 + pct//3)))
 
 def _map_jpeg_quality(pct: int) -> int:
-    # 10%≈90 ... 90%≈25
     return int(max(25, 100 - pct))
 
 def _map_webp_quality(pct: int) -> int:
     return int(max(25, 100 - pct))
 
 def _map_png_compresslevel(pct: int) -> int:
-    # 0..9
     return int(min(9, round((pct/100)*9)))
 
 def _map_pdf_res(pct: int) -> int:
-    # 10%≈300dpi ... 90%≈72dpi
     return int(max(72, 300 - (pct * (300-72))//100))
 
 def _map_pdf_jpegq(pct: int) -> int:
-    # 10%≈95 ... 90%≈35
     return int(max(35, 100 - int(pct*0.6)))
+
+# ======== ضغط ========
 
 async def compress_image(in_path: Path, pct: int, out_path: Path):
     with Image.open(in_path) as im:
@@ -492,39 +485,109 @@ async def compress_image(in_path: Path, pct: int, out_path: Path):
             im.save(out_path.with_suffix(".webp"), quality=q, method=6)
             return out_path.with_suffix(".webp")
         else:
-            # PNG أو غيره → PNG بضغط أعلى (lossless)
             cl = _map_png_compresslevel(pct)
             im.save(out_path.with_suffix(".png"), optimize=True, compress_level=cl)
             return out_path.with_suffix(".png")
 
+async def _gs_try(in_path: Path, out_path: Path, pct: int) -> bool:
+    """محاولة ضغط PDF عبر Ghostscript بإعدادات تفصيلية."""
+    dpi = _map_pdf_res(pct)
+    jpegq = _map_pdf_jpegq(pct)
+    cmd = [
+        BIN["gs"], "-sDEVICE=pdfwrite",
+        "-dCompatibilityLevel=1.4",
+        "-dNOPAUSE", "-dQUIET", "-dBATCH",
+        "-dDetectDuplicateImages=true",
+        "-dCompressFonts=true",
+        "-dSubsetFonts=true",
+        "-dEmbedAllFonts=true",
+        # Color
+        "-dDownsampleColorImages=true",
+        "-dColorImageDownsampleType=/Average",
+        f"-dColorImageResolution={dpi}",
+        "-dAutoFilterColorImages=false",
+        "-dEncodeColorImages=true",
+        "-dColorImageFilter=/DCTEncode",
+        f"-dJPEGQ={jpegq}",
+        # Gray
+        "-dDownsampleGrayImages=true",
+        "-dGrayImageDownsampleType=/Average",
+        f"-dGrayImageResolution={dpi}",
+        "-dAutoFilterGrayImages=false",
+        "-dEncodeGrayImages=true",
+        "-dGrayImageFilter=/DCTEncode",
+        # Mono
+        "-dDownsampleMonoImages=true",
+        "-dMonoImageDownsampleType=/Subsample",
+        f"-dMonoImageResolution={max(300, dpi)}",
+        "-dAutoFilterMonoImages=false",
+        "-dEncodeMonoImages=true",
+        "-dMonoImageFilter=/CCITTFaxEncode",
+        f"-sOutputFile={out_path.as_posix()}",
+        in_path.as_posix()
+    ]
+    code, out, err = await run_cmd(cmd, timeout=900)
+    ok = (code == 0 and out_path.exists() and out_path.stat().st_size > 0)
+    if not ok:
+        log.warning("gs detailed failed: %s", err or out)
+    return ok
+
+async def _gs_screen(in_path: Path, out_path: Path) -> bool:
+    """محاولة ثانية بإعداد جاهز صغير الحجم."""
+    cmd = [
+        BIN["gs"], "-sDEVICE=pdfwrite",
+        "-dCompatibilityLevel=1.4",
+        "-dPDFSETTINGS=/screen",
+        "-dNOPAUSE", "-dQUIET", "-dBATCH",
+        f"-sOutputFile={out_path.as_posix()}",
+        in_path.as_posix()
+    ]
+    code, out, err = await run_cmd(cmd, timeout=900)
+    ok = (code == 0 and out_path.exists() and out_path.stat().st_size > 0)
+    if not ok:
+        log.warning("gs /screen failed: %s", err or out)
+    return ok
+
 async def compress_pdf(in_path: Path, pct: int, out_path: Path):
+    """يضغط PDF ويحاول ألا يخرج بملف أكبر.
+       1) إعدادات تفصيلية (DCT + downsample)
+       2) إن لم تُصغّر: dPDFSETTINGS=/screen
+       3) إن لم تُصغّر: يرجّع نسخة من الأصل باسم *_keep.pdf
+    """
+    in_size = in_path.stat().st_size
+
     if BIN["gs"]:
-        dpi = _map_pdf_res(pct)
-        q = _map_pdf_jpegq(pct)
-        cmd = [
-            BIN["gs"], "-sDEVICE=pdfwrite",
-            "-dCompatibilityLevel=1.4",
-            "-dNOPAUSE", "-dQUIET", "-dBATCH",
-            "-dDownsampleColorImages=true",
-            f"-dColorImageResolution={dpi}",
-            "-dColorImageDownsampleType=/Average",
-            f"-dJPEGQ={q}",
-            f"-sOutputFile={out_path.as_posix()}",
-            in_path.as_posix()
-        ]
-        code, out, err = await run_cmd(cmd, timeout=900)
-        if code != 0 or not out_path.exists():
-            raise RuntimeError(err or out or "gs failed")
-        return out_path
+        # محاولة أولى
+        ok = await _gs_try(in_path, out_path, pct)
+        if ok and out_path.stat().st_size < in_size * 0.98:
+            return out_path
+
+        # محاولة ثانية
+        tmp2 = out_path.with_suffix(".screen.pdf")
+        ok2 = await _gs_screen(in_path, tmp2)
+        if ok2 and tmp2.stat().st_size < min(in_size, out_path.stat().st_size if out_path.exists() else in_size) * 0.98:
+            if out_path.exists():
+                out_path.unlink(missing_ok=True)
+            tmp2.rename(out_path)
+            return out_path
+        else:
+            # لم نصغّر بما فيه الكفاية: أعد الأصل باسم جديد
+            keep = out_path.with_name(out_path.stem.replace("_compressed", "") + "_compressed_keep.pdf")
+            shutil.copy2(in_path, keep)
+            if out_path.exists(): out_path.unlink(missing_ok=True)
+            return keep
+
     # Fallback: PyMuPDF (أضعف)
     try:
         doc = fitz.open(in_path.as_posix())
-        # لا توجد API مباشرة للجودة، لكن نستخدم تنظيف + ضغط
         doc.save(out_path.as_posix(), deflate=True, garbage=3)
         doc.close()
-        if not out_path.exists():
-            raise RuntimeError("fallback failed")
-        return out_path
+        if out_path.stat().st_size < in_size * 0.98:
+            return out_path
+        keep = out_path.with_name(out_path.stem.replace("_compressed", "") + "_compressed_keep.pdf")
+        shutil.copy2(in_path, keep)
+        out_path.unlink(missing_ok=True)
+        return keep
     except Exception:
         raise RuntimeError("ضغط PDF غير متاح (لا gs)، حاول نسبة أقل أو فعّل gs.")
 
@@ -532,7 +595,6 @@ async def compress_audio(in_path: Path, pct: int, out_path: Path):
     if not BIN["ffmpeg"]:
         raise RuntimeError("ffmpeg غير متوفر")
     br = _map_audio_bitrate(pct)
-    # نعيد الترميز إلى mp3
     dst = out_path.with_suffix(".mp3")
     cmd = [BIN["ffmpeg"], "-y", "-i", in_path.as_posix(), "-vn", "-b:a", f"{br}k", dst.as_posix()]
     code, out, err = await run_cmd(cmd)
@@ -589,7 +651,6 @@ async def cb_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "conv":
-        # اعرض خيارات التحويل القديمة حسب النوع
         options = conv_options(job.kind)
         if not options:
             await q.edit_message_text("لا توجد تحويلات مناسبة لهذا النوع حالياً.")
@@ -602,7 +663,6 @@ async def cb_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if row: kb.append(row)
         await q.edit_message_text(tr(update, "choose_action"), reply_markup=InlineKeyboardMarkup(kb))
     else:
-        # ضغط
         await q.edit_message_text(tr(update, "choose_ratio"), reply_markup=_percent_keyboard(token, update))
 
 async def cb_convert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -636,7 +696,6 @@ async def cb_convert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.exception("conversion error")
         await update.effective_chat.send_message(tr(update, "failed", err=str(e)[:200]))
     finally:
-        # نظّف وحذف التوكن
         try:
             if job.file_path.exists():
                 job.file_path.unlink(missing_ok=True)
@@ -782,7 +841,6 @@ async def do_compress(job: Job, pct: int) -> Path:
     if job.kind == "video":
         async with SEM_MEDIA:
             return await compress_video(job.file_path, pct, base)
-    # office/other → zip
     return await compress_other_zip(job.file_path, pct, base)
 
 # ======== تهيئة القناة/الأوامر ========
@@ -813,7 +871,7 @@ async def _post_init(app: Application):
         BotCommand("start", "Start / اختر اللغة"),
         BotCommand("help", "Help / المساعدة"),
         BotCommand("lang", "Language / تغيير اللغة"),
-        BotCommand("formats", "Admin: الصيغ (للمدير)"),
+        BotCommand("formats", "Admin: الصيغ (للمير)"),
         BotCommand("stats", "Admin: إحصائيات"),
     ])
 
@@ -852,7 +910,7 @@ def build_app() -> Application:
 def start_health_server():
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
-            return  # لا نكتب في اللوق
+            return
         def do_GET(self):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -870,8 +928,6 @@ def start_health_server():
 # ---------- التشغيل ----------
 def main() -> None:
     app = build_app()
-
-    # إصلاح Python 3.13: أنشئ event loop قبل run_*
     asyncio.set_event_loop(asyncio.new_event_loop())
 
     if MODE == "webhook" and PUBLIC_URL:
@@ -886,7 +942,6 @@ def main() -> None:
         )
         return
 
-    # polling + health server للبورت الخاص بـ Render
     log.info("PTB version at runtime: 22.x")
     log.info("CONFIG: MODE=polling PUBLIC_URL=%s PORT=%s", PUBLIC_URL or "-", PORT)
     start_health_server()
@@ -894,4 +949,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
