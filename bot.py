@@ -9,6 +9,7 @@ import re
 import shutil
 import tempfile
 import threading
+import sys
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -17,7 +18,8 @@ from typing import Dict, Optional, Tuple
 import httpx
 import fitz  # PyMuPDF
 from pdf2image import convert_from_path
-from pdf2docx import parse as pdf2docx_parse
+# من الآن سنستخدم pdf2docx عبر subprocess، لذا الإيمبورت المباشر غير ضروري للتنفيذ
+# from pdf2docx import parse as pdf2docx_parse
 from PIL import Image
 from telegram import (
     Update,
@@ -405,17 +407,20 @@ async def pdf_to_images_zip(in_path: Path, fmt: str, out_zip: Path):
         im.save(p)
         files.append(p)
     import zipfile
-    # ضغط أعلى للـ ZIP
     with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         for p in files:
             z.write(p, arcname=p.name)
 
 async def pdf_to_docx(in_path: Path, out_path: Path):
-    # شغل التحويل في ثريد حتى ما يوقف لوب asyncio
-    def _work():
-        pdf2docx_parse(in_path.as_posix(), out_path.as_posix())
-    await asyncio.to_thread(_work)
-    # تأكد أن الملف خرج فعلاً
+    """
+    تشغيل PDF→DOCX كعملية منفصلة حتى لا يعلّق اللوب.
+    يعادل: python -m pdf2docx parse input.pdf output.docx
+    """
+    cmd = [sys.executable, "-m", "pdf2docx", "parse", in_path.as_posix(), out_path.as_posix()]
+    # وقت أطول للملفات الكبيرة
+    code, out, err = await run_cmd(cmd, timeout=3600)
+    if code != 0:
+        raise RuntimeError(err or out or "pdf2docx failed")
     if (not out_path.exists()) or out_path.stat().st_size == 0:
         raise RuntimeError("PDF→DOCX لم يُنتج ملفاً صالحاً")
 
@@ -564,12 +569,10 @@ async def compress_pdf(in_path: Path, pct: int, out_path: Path):
     in_size = in_path.stat().st_size
 
     if BIN["gs"]:
-        # محاولة أولى
         ok = await _gs_try(in_path, out_path, pct)
         if ok and out_path.stat().st_size < in_size * 0.98:
             return out_path
 
-        # محاولة ثانية
         tmp2 = out_path.with_suffix(".screen.pdf")
         ok2 = await _gs_screen(in_path, tmp2)
         if ok2 and tmp2.stat().st_size < min(in_size, out_path.stat().st_size if out_path.exists() else in_size) * 0.98:
@@ -578,7 +581,6 @@ async def compress_pdf(in_path: Path, pct: int, out_path: Path):
             tmp2.rename(out_path)
             return out_path
         else:
-            # لم نصغّر بما فيه الكفاية: أعد الأصل باسم keep
             keep = out_path.with_name(out_path.stem.replace("_compressed", "") + "_compressed_keep.pdf")
             shutil.copy2(in_path, keep)
             if out_path.exists(): out_path.unlink(missing_ok=True)
@@ -987,3 +989,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
