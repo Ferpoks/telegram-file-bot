@@ -9,7 +9,6 @@ import re
 import shutil
 import tempfile
 import threading
-import sys
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -18,8 +17,7 @@ from typing import Dict, Optional, Tuple
 import httpx
 import fitz  # PyMuPDF
 from pdf2image import convert_from_path
-# من الآن سنستخدم pdf2docx عبر subprocess، لذا الإيمبورت المباشر غير ضروري للتنفيذ
-# from pdf2docx import parse as pdf2docx_parse
+from pdf2docx import parse as pdf2docx_parse
 from PIL import Image
 from telegram import (
     Update,
@@ -49,10 +47,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("convbot")
 
-# خفض ضجيج مكتبات التحويل
-logging.getLogger("pdf2docx").setLevel(logging.ERROR)
-logging.getLogger("pdfminer").setLevel(logging.ERROR)
-
 # بيئة
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
@@ -64,9 +58,11 @@ PORT = int(os.getenv("PORT", os.getenv("WEB_CONCURRENCY", "10000")))
 # MODE: webhook | polling
 MODE = (os.getenv("MODE", "").strip().lower() or ("webhook" if PUBLIC_URL else "polling"))
 
-# حدود حجم تيليجرام
-TG_LIMIT_MB = int(os.getenv("TG_LIMIT_MB", "49"))
+# حدود تيليجرام
+TG_LIMIT_MB = int(os.getenv("TG_LIMIT_MB", "49"))                 # حد الإرسال
 TG_LIMIT = TG_LIMIT_MB * 1024 * 1024
+TG_DL_LIMIT_MB = int(os.getenv("TG_DL_LIMIT_MB", "20"))           # حد التنزيل من السيرفرات
+TG_DL_LIMIT = TG_DL_LIMIT_MB * 1024 * 1024
 
 # التوازي
 CONC_IMAGE = int(os.getenv("CONC_IMAGE", "20"))
@@ -120,6 +116,7 @@ T = {
         "join_btn": "الانضمام للقناة",
         "joined_ok": "✅ تم التحقق من الاشتراك. أرسل ملفك الآن.",
         "file_too_big": "❌ الملف أكبر من الحد المسموح ({mb}MB).",
+        "file_too_big_dl": "❌ تيليجرام يمنع تنزيل الملفات الأكبر من {mb}MB عبر البوت. أرسل ملفًا أصغر أو رابط تحميل مباشر (HTTP/HTTPS).",
         "choose_section": "اختر القسم:",
         "sec_convert": "🔁 تحويل الملفات",
         "sec_compress": "🗜️ ضغط الملفات",
@@ -148,6 +145,7 @@ T = {
         "join_btn": "Join channel",
         "joined_ok": "✅ Subscription verified. Send your file.",
         "file_too_big": "❌ File exceeds allowed limit ({mb}MB).",
+        "file_too_big_dl": "❌ Telegram prevents bots from downloading files larger than {mb}MB. Please send a smaller file or a direct HTTP/HTTPS link.",
         "choose_section": "Pick a section:",
         "sec_convert": "🔁 Convert",
         "sec_compress": "🗜️ Compress",
@@ -174,8 +172,7 @@ def tr(update: Update, key: str, **kw) -> str:
 
 def reply_kb():
     return ReplyKeyboardMarkup(
-        [[KeyboardButton("/start"), KeyboardButton("/help")]],
-        resize_keyboard=True
+        [[KeyboardButton("/start"), KeyboardButton("/help")]], resize_keyboard=True
     )
 
 def clean_name(name: str) -> str:
@@ -355,11 +352,19 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         return
 
-    if size > TG_LIMIT:
+    kind = detect_kind(fname, mime)
+    log.info("[download] incoming name=%s kind=%s size=%.2fMB", fname, kind, (size or 0)/1024/1024)
+
+    # 1) حد تنزيل تيليجرام (تقريباً 20MB) — نوقف قبل get_file حتى لا يرمي 400
+    if size and size > TG_DL_LIMIT:
+        await msg.reply_text(tr(update, "file_too_big_dl", mb=TG_DL_LIMIT_MB))
+        return
+
+    # 2) نتأكد أيضاً من حد الإرسال حتى لا نجهد المعالجة بلا فائدة
+    if size and size > TG_LIMIT:
         await msg.reply_text(tr(update, "file_too_big", mb=TG_LIMIT_MB))
         return
 
-    kind = detect_kind(fname, mime)
     tmpd = Path(tempfile.mkdtemp(prefix=f"u{update.effective_user.id}_", dir=WORK_ROOT))
     in_path = tmpd / (SAFE_CHARS.sub("_", fname)[:128] or "file")
     fobj = await ctx.bot.get_file(file_id)
@@ -407,22 +412,12 @@ async def pdf_to_images_zip(in_path: Path, fmt: str, out_zip: Path):
         im.save(p)
         files.append(p)
     import zipfile
-    with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+    with zipfile.ZipFile(out_zip, "w") as z:
         for p in files:
             z.write(p, arcname=p.name)
 
 async def pdf_to_docx(in_path: Path, out_path: Path):
-    """
-    تشغيل PDF→DOCX كعملية منفصلة حتى لا يعلّق اللوب.
-    يعادل: python -m pdf2docx parse input.pdf output.docx
-    """
-    cmd = [sys.executable, "-m", "pdf2docx", "parse", in_path.as_posix(), out_path.as_posix()]
-    # وقت أطول للملفات الكبيرة
-    code, out, err = await run_cmd(cmd, timeout=3600)
-    if code != 0:
-        raise RuntimeError(err or out or "pdf2docx failed")
-    if (not out_path.exists()) or out_path.stat().st_size == 0:
-        raise RuntimeError("PDF→DOCX لم يُنتج ملفاً صالحاً")
+    pdf2docx_parse(in_path.as_posix(), out_path.as_posix())
 
 async def office_to_pdf(in_path: Path, out_path: Path):
     if BIN["soffice"]:
@@ -506,7 +501,6 @@ async def compress_image(in_path: Path, pct: int, out_path: Path):
             return out_path.with_suffix(".png")
 
 async def _gs_try(in_path: Path, out_path: Path, pct: int) -> bool:
-    """محاولة ضغط PDF عبر Ghostscript بإعدادات تفصيلية."""
     dpi = _map_pdf_res(pct)
     jpegq = _map_pdf_jpegq(pct)
     cmd = [
@@ -517,7 +511,6 @@ async def _gs_try(in_path: Path, out_path: Path, pct: int) -> bool:
         "-dCompressFonts=true",
         "-dSubsetFonts=true",
         "-dEmbedAllFonts=true",
-        # Color
         "-dDownsampleColorImages=true",
         "-dColorImageDownsampleType=/Average",
         f"-dColorImageResolution={dpi}",
@@ -525,14 +518,12 @@ async def _gs_try(in_path: Path, out_path: Path, pct: int) -> bool:
         "-dEncodeColorImages=true",
         "-dColorImageFilter=/DCTEncode",
         f"-dJPEGQ={jpegq}",
-        # Gray
         "-dDownsampleGrayImages=true",
         "-dGrayImageDownsampleType=/Average",
         f"-dGrayImageResolution={dpi}",
         "-dAutoFilterGrayImages=false",
         "-dEncodeGrayImages=true",
         "-dGrayImageFilter=/DCTEncode",
-        # Mono
         "-dDownsampleMonoImages=true",
         "-dMonoImageDownsampleType=/Subsample",
         f"-dMonoImageResolution={max(300, dpi)}",
@@ -549,7 +540,6 @@ async def _gs_try(in_path: Path, out_path: Path, pct: int) -> bool:
     return ok
 
 async def _gs_screen(in_path: Path, out_path: Path) -> bool:
-    """محاولة ثانية بإعداد جاهز صغير الحجم."""
     cmd = [
         BIN["gs"], "-sDEVICE=pdfwrite",
         "-dCompatibilityLevel=1.4",
@@ -565,7 +555,6 @@ async def _gs_screen(in_path: Path, out_path: Path) -> bool:
     return ok
 
 async def compress_pdf(in_path: Path, pct: int, out_path: Path):
-    """يضغط PDF ويحاول ألا يخرج بملف أكبر."""
     in_size = in_path.stat().st_size
 
     if BIN["gs"]:
@@ -586,7 +575,6 @@ async def compress_pdf(in_path: Path, pct: int, out_path: Path):
             if out_path.exists(): out_path.unlink(missing_ok=True)
             return keep
 
-    # Fallback: PyMuPDF (أضعف)
     try:
         doc = fitz.open(in_path.as_posix())
         doc.save(out_path.as_posix(), deflate=True, garbage=3)
@@ -764,24 +752,6 @@ async def cb_compress(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ======== تنفيذ التحويل/الضغط ========
 
-def ensure_tg_sized(path: Path) -> Path:
-    """لو الناتج أكبر من حد تيليجرام، نحاول نضغطه كـ ZIP، وإلا نرمي خطأ واضح."""
-    if path.stat().st_size <= TG_LIMIT:
-        return path
-    import zipfile
-    zip_path = path.with_suffix(path.suffix + ".zip")
-    try:
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-            z.write(path, arcname=path.name)
-        if zip_path.stat().st_size <= TG_LIMIT:
-            return zip_path
-    except Exception:
-        pass
-    raise RuntimeError(
-        f"الناتج أكبر من حد تيليجرام ({TG_LIMIT_MB}MB). "
-        f"جرّب ضغط بنسبة أعلى أو قسّم الملف قبل التحويل."
-    )
-
 async def do_convert(job: Job, code: str) -> Path:
     ext_map = {
         "to_png": ".png", "to_jpg": ".jpg", "to_webp": ".webp",
@@ -852,10 +822,7 @@ async def do_convert(job: Job, code: str) -> Path:
 
     if not out_path.exists():
         raise RuntimeError("لم يُنتج ملف ناتج.")
-    out_final = out_path.rename(
-        out_path.with_name(SAFE_CHARS.sub("_", out_path.name)[:128] or "out")
-    )
-    return ensure_tg_sized(out_final)
+    return out_path.rename(out_path.with_name(SAFE_CHARS.sub("_", out_path.name)[:128] or "out"))
 
 async def do_compress(job: Job, pct: int) -> Path:
     base = job.file_path.parent / (Path(job.file_name).stem + f"_compressed_{pct}")
@@ -947,16 +914,6 @@ def start_health_server():
             self.end_headers()
             body = json.dumps({"ok": True, "mode": MODE}).encode()
             self.wfile.write(body)
-        # تنظيف 502 على /webhook لو كنا على polling
-        def do_POST(self):
-            if self.path == "/webhook":
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"ok": true, "mode": "polling"}')
-            else:
-                self.send_response(404)
-                self.end_headers()
 
     def _serve():
         httpd = HTTPServer(("0.0.0.0", PORT), Handler)
@@ -989,4 +946,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
